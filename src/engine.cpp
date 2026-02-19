@@ -62,6 +62,11 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
              eng->n_layers, eng->n_embd, eng->n_heads, eng->n_heads_kv,
              eng->n_ff, eng->n_vocab, eng->head_dim);
 
+    // Initialize CUDA context early — ensures driver/runtime are compatible
+    // before any allocations. cudaFree(0) is the canonical way to force init.
+    JINF_CUDA_CHECK(cudaSetDevice(0));
+    JINF_CUDA_CHECK(cudaFree(0));
+
     // Create io_uring context
     jinf_io_config io_cfg = {
         .queue_depth = config->io_queue_depth,
@@ -90,17 +95,30 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
 
     JINF_CUDA_CHECK(cudaMalloc(&eng->hot_weights_gpu, hot_size));
 
-    // Read hot weights via io_uring into a temp pinned buffer, then copy to GPU
-    void* hot_buf = nullptr;
-    JINF_CUDA_CHECK(cudaHostAlloc(&hot_buf, JINF_ALIGN_4K(hot_size), cudaHostAllocDefault));
-    s = jinf_io_read_sync(eng->io, eng->fd_model, hot_buf, hot_offset, hot_size);
-    if (s != JINF_OK) {
-        cudaFreeHost(hot_buf);
-        jinf_engine_destroy(eng);
-        return s;
+    // Load hot weights in chunks via a small staging buffer to avoid
+    // doubling memory usage (critical on Jetson unified memory).
+    static const size_t STAGING_SIZE = 4 * 1024 * 1024; // 4 MB
+    void* staging = nullptr;
+    JINF_CUDA_CHECK(cudaHostAlloc(&staging, STAGING_SIZE, cudaHostAllocDefault));
+
+    size_t remaining = (size_t)hot_size;
+    size_t off = 0;
+    while (remaining > 0) {
+        size_t chunk = std::min(remaining, STAGING_SIZE);
+        size_t aligned_chunk = JINF_ALIGN_4K(chunk);
+        s = jinf_io_read_sync(eng->io, eng->fd_model, staging,
+                               hot_offset + off, aligned_chunk);
+        if (s != JINF_OK) {
+            cudaFreeHost(staging);
+            jinf_engine_destroy(eng);
+            return s;
+        }
+        JINF_CUDA_CHECK(cudaMemcpy((char*)eng->hot_weights_gpu + off,
+                                    staging, chunk, cudaMemcpyHostToDevice));
+        off += chunk;
+        remaining -= chunk;
     }
-    JINF_CUDA_CHECK(cudaMemcpy(eng->hot_weights_gpu, hot_buf, hot_size, cudaMemcpyHostToDevice));
-    cudaFreeHost(hot_buf);
+    cudaFreeHost(staging);
 
     // Build per-layer pointers
     eng->layers = (jinf_layer_ptrs*)calloc(eng->n_layers, sizeof(jinf_layer_ptrs));
