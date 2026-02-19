@@ -1,5 +1,6 @@
 #include "jinf/gguf.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
