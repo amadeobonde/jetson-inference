@@ -296,18 +296,19 @@ int main(int argc, char** argv) {
         uint32_t n_embd = hdr.n_embd;
         uint32_t n_ff = hdr.n_ff;
 
-        // Compute bundle size: for each neuron, gate_row + up_row + down_col
-        // Use primary type to compute row size (the per-tensor type may differ,
-        // but we use the largest common row size for uniform bundle_size)
+        // Compute bundle size: for each neuron, gate_row + up_row + down_col(float32)
+        // Gate and up are quantized rows, but down column is stored as float32
+        // (extracting columns from block-quantized matrices requires dequantization).
         jinf_qtype qt = (jinf_qtype)hdr.primary_type;
         int block_size = jinf_qtype_block_size(qt);
         size_t type_size = jinf_qtype_type_size(qt);
         size_t row_bytes = (size_t)((n_embd + block_size - 1) / block_size) * type_size;
-        size_t raw_bundle = 3 * row_bytes;
+        size_t down_col_bytes = (size_t)n_embd * sizeof(float);
+        size_t raw_bundle = 2 * row_bytes + down_col_bytes;
         size_t padded_bundle = JINF_ALIGN_4K(raw_bundle);
 
-        printf("  Bundle: row=%zu bytes, raw=%zu, padded=%zu (per neuron)\n",
-               row_bytes, raw_bundle, padded_bundle);
+        printf("  Bundle: gate/up_row=%zu, down_col(f32)=%zu, raw=%zu, padded=%zu (per neuron)\n",
+               row_bytes, down_col_bytes, raw_bundle, padded_bundle);
 
         // Prepare bundle layer descriptors
         std::vector<jinf_nvmw_bundle_layer_desc> bundle_layer_descs(hdr.n_layers);
