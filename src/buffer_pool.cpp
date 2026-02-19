@@ -140,3 +140,22 @@ jinf_status jinf_buffer_wait_compute_done(jinf_buffer_pair* bp) {
     JINF_CUDA_CHECK(cudaEventSynchronize(bp->compute_done));
     return JINF_OK;
 }
+
+// ---- Phase 2: Neuron bundle reads ----
+
+jinf_status jinf_buffer_start_bundle_range_read(
+    jinf_buffer_pair* bp, jinf_io_context* io, int fd,
+    size_t file_offset, size_t total_size) {
+    // This is essentially the same as start_read — read a contiguous range
+    // into the inactive buffer. The caller computes the range covering
+    // all needed bundles and reads the whole thing.
+    return jinf_buffer_start_read(bp, io, fd, file_offset, total_size);
+}
+
+void* jinf_buffer_get_bundle(jinf_buffer_pair* bp, int base_neuron,
+                              int target_neuron, size_t bundle_size) {
+    if (!bp) return nullptr;
+    int inactive = 1 - bp->active;
+    size_t offset = (size_t)(target_neuron - base_neuron) * bundle_size;
+    return (char*)bp->host_pinned[inactive] + offset;
+}

@@ -16,12 +16,14 @@ struct profile_args {
     const char* model_path;
     const char* output_path;
     int num_samples;
+    float threshold;
 };
 
 static bool parse_args(int argc, char** argv, profile_args* args) {
     args->model_path = nullptr;
     args->output_path = "activations.bin";
     args->num_samples = 1000;
+    args->threshold = 0.1f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -30,15 +32,42 @@ static bool parse_args(int argc, char** argv, profile_args* args) {
             args->output_path = argv[++i];
         } else if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) {
             args->num_samples = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
+            args->threshold = (float)atof(argv[++i]);
         }
     }
 
     if (!args->model_path) {
-        fprintf(stderr, "Usage: %s --model <model.nvmw> [--output <activations.bin>] [--samples N]\n",
-                argv[0]);
+        fprintf(stderr, "Usage: %s --model <model.nvmw> [--output <activations.bin>] "
+                "[--samples N] [--threshold F]\n", argv[0]);
         return false;
     }
     return true;
+}
+
+// FFN hook callback data
+struct hook_state {
+    std::vector<std::vector<int>>* counts;
+    std::vector<float>* host_buf;   // reusable host buffer [n_ff]
+    float threshold;
+    int n_ff;
+};
+
+// FFN profiling callback: copies gate output to host, applies SiLU threshold
+static void ffn_profile_hook(void* user_data, int layer, const float* gate_output, int n_ff) {
+    hook_state* hs = (hook_state*)user_data;
+
+    // Copy gate values from GPU to host
+    cudaMemcpy(hs->host_buf->data(), gate_output, n_ff * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Check |SiLU(gate[i])| > threshold
+    for (int i = 0; i < n_ff; i++) {
+        float g = (*hs->host_buf)[i];
+        float silu_val = g / (1.0f + expf(-g));
+        if (fabsf(silu_val) > hs->threshold) {
+            (*hs->counts)[layer][i]++;
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -61,9 +90,21 @@ int main(int argc, char** argv) {
 
     // Activation frequency counters: [n_layers][n_ff]
     std::vector<std::vector<int>> counts(n_layers, std::vector<int>(n_ff, 0));
+    std::vector<float> host_buf(n_ff);
     int total_tokens = 0;
 
-    printf("Profiling activations over %d samples...\n", args.num_samples);
+    // Set up FFN profiling hook
+    hook_state hs;
+    hs.counts = &counts;
+    hs.host_buf = &host_buf;
+    hs.threshold = args.threshold;
+    hs.n_ff = n_ff;
+
+    engine->ffn_hook = ffn_profile_hook;
+    engine->ffn_hook_data = &hs;
+
+    printf("Profiling activations over %d samples (threshold=%.2f)...\n",
+           args.num_samples, args.threshold);
     printf("Model: %d layers, %d FFN neurons per layer\n", n_layers, n_ff);
 
     // Generate random token sequences for calibration
@@ -76,7 +117,7 @@ int main(int argc, char** argv) {
             tokens[i] = rand() % engine->n_vocab;
         }
 
-        // Run forward pass
+        // Run forward pass — hook captures activations automatically
         float* logits = nullptr;
         s = jinf_engine_forward(engine, tokens.data(), prompt_len, &logits);
         if (s != JINF_OK) {
@@ -84,11 +125,6 @@ int main(int argc, char** argv) {
                     sample, jinf_status_str(s));
             continue;
         }
-
-        // TODO: Hook into the FFN to capture actual activations per neuron.
-        // For the profiler MVP, we count which neurons have gate activations > threshold.
-        // This requires instrumenting the engine's forward pass, which is Phase 2 work.
-        // For now, we record placeholder uniform frequencies.
 
         total_tokens += prompt_len;
         jinf_engine_reset(engine);
@@ -98,6 +134,10 @@ int main(int argc, char** argv) {
                    sample + 1, args.num_samples, total_tokens);
         }
     }
+
+    // Disable hook before cleanup
+    engine->ffn_hook = nullptr;
+    engine->ffn_hook_data = nullptr;
 
     // Write activation profile
     FILE* fp = fopen(args.output_path, "wb");

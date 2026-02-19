@@ -4,6 +4,7 @@
 #include "jinf/nvmw.h"
 #include "jinf/nvme_io.h"
 #include "jinf/buffer_pool.h"
+#include "jinf/predictor.h"
 #include <cstdint>
 #include <cstddef>
 #include <cuda_runtime.h>
@@ -28,15 +29,21 @@ struct jinf_engine_config {
     size_t      buffer_capacity;   // per-buffer capacity for double buffering
     int         max_context;       // max sequence length
     int         io_queue_depth;    // io_uring queue depth
+
+    // Phase 2: Sparse FFN
+    const char* predictor_path;   // path to predictor weights (nullptr = dense mode)
+    float       sparsity_threshold; // predictor threshold (default 0.5)
 };
 
 static inline jinf_engine_config jinf_engine_config_default() {
     return {
-        .model_path       = nullptr,
-        .gpu_memory_budget = (size_t)4500 * 1024 * 1024,
-        .buffer_capacity   = (size_t)128 * 1024 * 1024,
-        .max_context       = 512,
-        .io_queue_depth    = 64,
+        .model_path         = nullptr,
+        .gpu_memory_budget  = (size_t)4500 * 1024 * 1024,
+        .buffer_capacity    = (size_t)128 * 1024 * 1024,
+        .max_context        = 512,
+        .io_queue_depth     = 64,
+        .predictor_path     = nullptr,
+        .sparsity_threshold = 0.5f,
     };
 }
 
@@ -71,6 +78,10 @@ struct jinf_layer_ptrs {
 
     bool is_hot;         // all weights for this layer are GPU-resident
 };
+
+// ---- FFN profiling hook (Phase 2) ----
+
+typedef void (*jinf_ffn_hook_fn)(void* user_data, int layer, const float* gate_output, int n_ff);
 
 // ---- Engine state ----
 
@@ -127,6 +138,19 @@ struct jinf_engine {
     float rms_norm_eps;
     float rope_freq_base;
     int32_t primary_type;  // jinf_qtype
+
+    // FFN profiling hook (Phase 2)
+    jinf_ffn_hook_fn ffn_hook;
+    void*            ffn_hook_data;
+
+    // Phase 2: Sparse FFN
+    jinf_activation_predictor* predictor;
+    float* sparse_gate_up_tmp;       // pre-allocated [n_ff] on GPU for sparse FFN
+    float* host_hidden_state;        // pinned host buffer for predictor input [n_embd]
+    int*   host_active_ids;          // host buffer for predicted neuron IDs [n_ff]
+    int*   dev_bundle_offsets;       // device buffer for bundle byte offsets [n_ff]
+    bool   sparse_enabled;
+    size_t bundle_size;              // padded bytes per neuron bundle (from NVMW)
 
     // Stats
     jinf_perf_stats perf;

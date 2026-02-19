@@ -170,6 +170,11 @@ struct jinf_nvmw_reader {
     std::vector<jinf_nvmw_layer_desc> layer_descs;
     std::vector<jinf_nvmw_tensor_entry> tensor_entries;
     char path[1024];
+
+    // Phase 2: bundle data (populated if bundle_index_offset != 0)
+    bool has_bundles;
+    jinf_nvmw_bundle_header bundle_header;
+    std::vector<jinf_nvmw_bundle_layer_desc> bundle_layer_descs;
 };
 
 jinf_status jinf_nvmw_open(jinf_nvmw_reader** r, const char* path) {
@@ -215,7 +220,27 @@ jinf_status jinf_nvmw_open(jinf_nvmw_reader** r, const char* path) {
         }
     }
 
-    fclose(fp);
+    // Phase 2: load bundle data if present
+    rd->has_bundles = false;
+    if (rd->header.bundle_index_offset != 0) {
+        fp = fopen(path, "rb");
+        if (fp) {
+            fseek(fp, (long)rd->header.bundle_index_offset, SEEK_SET);
+            if (fread(&rd->bundle_header, sizeof(jinf_nvmw_bundle_header), 1, fp) == 1) {
+                rd->bundle_layer_descs.resize(rd->bundle_header.n_bundle_layers);
+                bool ok = true;
+                for (uint32_t i = 0; i < rd->bundle_header.n_bundle_layers; i++) {
+                    if (fread(&rd->bundle_layer_descs[i], sizeof(jinf_nvmw_bundle_layer_desc), 1, fp) != 1) {
+                        ok = false;
+                        break;
+                    }
+                }
+                rd->has_bundles = ok;
+            }
+            fclose(fp);
+        }
+    }
+
     *r = rd;
     return JINF_OK;
 }
@@ -262,4 +287,55 @@ const jinf_nvmw_tensor_entry* jinf_nvmw_find_tensor(const jinf_nvmw_reader* r, c
         if (strcmp(te.name, name) == 0) return &te;
     }
     return nullptr;
+}
+
+// ---- Bundle reader API (Phase 2) ----
+
+bool jinf_nvmw_has_bundles(const jinf_nvmw_reader* r) {
+    return r && r->has_bundles;
+}
+
+const jinf_nvmw_bundle_header* jinf_nvmw_get_bundle_header(const jinf_nvmw_reader* r) {
+    if (!r || !r->has_bundles) return nullptr;
+    return &r->bundle_header;
+}
+
+const jinf_nvmw_bundle_layer_desc* jinf_nvmw_get_bundle_layer_desc(const jinf_nvmw_reader* r, int layer) {
+    if (!r || !r->has_bundles) return nullptr;
+    if (layer < 0 || layer >= (int)r->bundle_layer_descs.size()) return nullptr;
+    return &r->bundle_layer_descs[layer];
+}
+
+uint64_t jinf_nvmw_get_neuron_bundle_offset(const jinf_nvmw_reader* r, int layer, int neuron_id) {
+    const jinf_nvmw_bundle_layer_desc* bld = jinf_nvmw_get_bundle_layer_desc(r, layer);
+    if (!bld) return 0;
+    return bld->bundles_offset + (uint64_t)neuron_id * bld->bundle_size;
+}
+
+// ---- Writer bundle API (Phase 2) ----
+
+jinf_status jinf_nvmw_writer_write_bundle_section(jinf_nvmw_writer* w,
+    const jinf_nvmw_bundle_header* bh,
+    const jinf_nvmw_bundle_layer_desc* layer_descs,
+    int n_layers) {
+    if (!w || !w->fp || !bh || !layer_descs) return JINF_ERR_INVALID;
+
+    // Pad to 4K before writing bundle index
+    jinf_status s = pad_to_4k(w->fp);
+    if (s != JINF_OK) return s;
+
+    long bundle_index_pos = ftell(w->fp);
+
+    // Write bundle header
+    if (fwrite(bh, sizeof(jinf_nvmw_bundle_header), 1, w->fp) != 1) return JINF_ERR_IO;
+
+    // Write per-layer bundle descriptors
+    for (int i = 0; i < n_layers; i++) {
+        if (fwrite(&layer_descs[i], sizeof(jinf_nvmw_bundle_layer_desc), 1, w->fp) != 1) return JINF_ERR_IO;
+    }
+
+    // Store the bundle index offset in the header
+    w->header.bundle_index_offset = (uint64_t)bundle_index_pos;
+
+    return JINF_OK;
 }

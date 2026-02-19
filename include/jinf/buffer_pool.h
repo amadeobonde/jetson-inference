@@ -53,3 +53,20 @@ jinf_status jinf_buffer_signal_compute_done(jinf_buffer_pair* bp);
 
 // Wait until GPU compute on the active buffer is done (before overwriting it).
 jinf_status jinf_buffer_wait_compute_done(jinf_buffer_pair* bp);
+
+// ---- Phase 2: Neuron bundle reads ----
+
+// Read a contiguous range of neuron bundles into the inactive buffer.
+// file_offset: absolute file offset of the first bundle in range
+// total_size:  total bytes to read (covers the range from min to max neuron)
+// Uses the simpler contiguous-read approach (all bundles are sequential in file).
+jinf_status jinf_buffer_start_bundle_range_read(
+    jinf_buffer_pair* bp, jinf_io_context* io, int fd,
+    size_t file_offset, size_t total_size);
+
+// After wait_read completes, get a pointer to a specific bundle within the buffer.
+// base_neuron: the first neuron ID that was read (the range start)
+// target_neuron: the neuron ID to get
+// bundle_size: bytes per bundle
+void* jinf_buffer_get_bundle(jinf_buffer_pair* bp, int base_neuron,
+                              int target_neuron, size_t bundle_size);

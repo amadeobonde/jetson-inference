@@ -16,8 +16,9 @@
 // [Cold Layer 1: 4K-aligned]
 // ...
 
-#define JINF_NVMW_MAGIC   0x574D564E  // "NVMW" in little-endian
-#define JINF_NVMW_VERSION 1
+#define JINF_NVMW_MAGIC           0x574D564E  // "NVMW" in little-endian
+#define JINF_NVMW_VERSION         1
+#define JINF_NVMW_VERSION_BUNDLED 2
 
 // ---- Per-tensor entry in the layer index ----
 
@@ -41,6 +42,27 @@ struct jinf_nvmw_layer_desc {
     uint32_t n_cold_tensors;
     uint32_t _pad;
 };
+
+// ---- Neuron bundle structures (Phase 2: Sparse FFN) ----
+//
+// Bundle layout per neuron: gate_row + up_row + down_col in original quant format,
+// padded to 4K alignment for O_DIRECT compatibility.
+
+#pragma pack(push, 1)
+struct jinf_nvmw_bundle_header {
+    uint32_t n_bundle_layers;      // number of layers with bundles
+    uint32_t bundle_size;          // bytes per neuron bundle (padded to 4K)
+    uint32_t n_ff;                 // neurons per layer
+    uint32_t _pad;
+};
+
+struct jinf_nvmw_bundle_layer_desc {
+    uint64_t bundles_offset;       // absolute file offset to this layer's bundles
+    uint64_t bundles_total_size;   // n_ff * bundle_size
+    uint32_t n_neurons;            // == n_ff
+    uint32_t bundle_size;          // bytes per bundle for this layer
+};
+#pragma pack(pop)
 
 // ---- File header (fits in 4KB) ----
 
@@ -71,8 +93,11 @@ struct jinf_nvmw_header {
     int32_t  primary_type;       // 4 (jinf_qtype value)
     uint32_t _pad0;              // 4
 
-    // Total: 4*4 + 6*8 + 6*4 + 2*4 + 4 + 4 = 16+48+24+8+4+4 = 104
-    uint8_t  _reserved[4096 - 104];
+    // Phase 2: bundle index offset (0 = no bundles, backwards compatible)
+    uint64_t bundle_index_offset;   // 8
+
+    // Total: 104 + 8 = 112
+    uint8_t  _reserved[4096 - 112];
 };
 #pragma pack(pop)
 static_assert(sizeof(jinf_nvmw_header) == 4096, "NVMW header must be 4KB");
@@ -109,3 +134,24 @@ jinf_status jinf_nvmw_get_hot_range(const jinf_nvmw_reader* r, uint64_t* offset,
 
 // Find a tensor entry by name. Returns nullptr if not found.
 const jinf_nvmw_tensor_entry* jinf_nvmw_find_tensor(const jinf_nvmw_reader* r, const char* name);
+
+// ---- Bundle reader API (Phase 2) ----
+
+// Check if bundles are present in this file (version >= 2, bundle_index_offset != 0)
+bool jinf_nvmw_has_bundles(const jinf_nvmw_reader* r);
+
+// Get bundle header. Returns nullptr if no bundles.
+const jinf_nvmw_bundle_header* jinf_nvmw_get_bundle_header(const jinf_nvmw_reader* r);
+
+// Get bundle layer descriptor for a given layer. Returns nullptr if out of range.
+const jinf_nvmw_bundle_layer_desc* jinf_nvmw_get_bundle_layer_desc(const jinf_nvmw_reader* r, int layer);
+
+// Get the absolute file offset for a specific neuron bundle in a given layer.
+uint64_t jinf_nvmw_get_neuron_bundle_offset(const jinf_nvmw_reader* r, int layer, int neuron_id);
+
+// ---- Writer bundle API (Phase 2) ----
+
+jinf_status jinf_nvmw_writer_write_bundle_section(jinf_nvmw_writer* w,
+    const jinf_nvmw_bundle_header* bh,
+    const jinf_nvmw_bundle_layer_desc* layer_descs,
+    int n_layers);

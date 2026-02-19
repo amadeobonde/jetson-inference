@@ -1,5 +1,6 @@
 #include "jinf/engine.h"
 #include "jinf/quant.h"
+#include "jinf/sparse_ops.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -215,6 +216,44 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
     // Create compute stream
     JINF_CUDA_CHECK(cudaStreamCreate(&eng->compute_stream));
 
+    // Phase 2: Initialize sparse FFN if predictor path is provided
+    eng->sparse_enabled = false;
+    eng->predictor = nullptr;
+    eng->sparse_gate_up_tmp = nullptr;
+    eng->host_hidden_state = nullptr;
+    eng->host_active_ids = nullptr;
+    eng->dev_bundle_offsets = nullptr;
+    eng->bundle_size = 0;
+
+    if (config->predictor_path && jinf_nvmw_has_bundles(eng->model)) {
+        s = jinf_predictor_create(&eng->predictor, config->predictor_path,
+                                   config->sparsity_threshold);
+        if (s == JINF_OK) {
+            // Allocate sparse FFN buffers
+            JINF_CUDA_CHECK(cudaMalloc((void**)&eng->sparse_gate_up_tmp,
+                                        eng->n_ff * sizeof(float)));
+            JINF_CUDA_CHECK(cudaHostAlloc((void**)&eng->host_hidden_state,
+                                           eng->n_embd * sizeof(float), cudaHostAllocDefault));
+
+            eng->host_active_ids = (int*)malloc(eng->n_ff * sizeof(int));
+            JINF_CUDA_CHECK(cudaMalloc((void**)&eng->dev_bundle_offsets,
+                                        eng->n_ff * sizeof(int)));
+
+            const jinf_nvmw_bundle_header* bh = jinf_nvmw_get_bundle_header(eng->model);
+            eng->bundle_size = bh ? bh->bundle_size : 0;
+
+            eng->sparse_enabled = (eng->bundle_size > 0);
+
+            if (eng->sparse_enabled) {
+                JINF_LOG("Sparse FFN enabled: bundle_size=%zu", eng->bundle_size);
+            }
+        } else {
+            JINF_LOG("Warning: Failed to load predictor, using dense FFN");
+        }
+    } else if (config->predictor_path) {
+        JINF_LOG("Warning: Predictor path set but model has no bundles, using dense FFN");
+    }
+
     memset(&eng->perf, 0, sizeof(eng->perf));
 
     *e = eng;
@@ -223,6 +262,13 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
 
 void jinf_engine_destroy(jinf_engine* e) {
     if (!e) return;
+
+    // Phase 2: cleanup sparse FFN
+    if (e->predictor) jinf_predictor_destroy(e->predictor);
+    if (e->sparse_gate_up_tmp) cudaFree(e->sparse_gate_up_tmp);
+    if (e->host_hidden_state) cudaFreeHost(e->host_hidden_state);
+    free(e->host_active_ids);
+    if (e->dev_bundle_offsets) cudaFree(e->dev_bundle_offsets);
 
     if (e->compute_stream) cudaStreamDestroy(e->compute_stream);
     if (e->host_logits) cudaFreeHost(e->host_logits);
@@ -287,6 +333,87 @@ static void embed_token(jinf_engine* e, int32_t token_id, float* out) {
     }
 }
 
+// ---- Phase 2: Sparse FFN for one layer ----
+// Called after attention is done. Replaces the dense FFN steps (8-10).
+// Works for both hot and cold layers — the bundle data is passed as a GPU-accessible pointer.
+static jinf_status forward_layer_sparse_ffn(jinf_engine* e, int layer, float* hidden_state,
+                                              const void* bundle_data, int gate_qtype) {
+    int n = e->n_embd;
+    int n_ff = e->n_ff;
+    cudaStream_t stream = e->compute_stream;
+    jinf_layer_ptrs* lp = &e->layers[layer];
+
+    float* norm_out = e->scratch_a;
+
+    // 8. FFN RMSNorm
+    jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, lp->ffn_norm_type, stream);
+
+    // Predict active neurons (CPU side)
+    // Copy norm_out to host for predictor (needed for future MLP predictor)
+    cudaStreamSynchronize(stream);
+    cudaMemcpy(e->host_hidden_state, norm_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    int n_active = 0;
+    jinf_status s = jinf_predictor_predict(e->predictor, e->host_hidden_state, layer,
+                                            e->host_active_ids, &n_active);
+    if (s != JINF_OK || n_active == 0) {
+        // Fallback: no neurons active, just skip FFN (output is just the residual)
+        return JINF_OK;
+    }
+
+    // Build bundle offsets array on host, then copy to device
+    // Each active neuron's bundle is at: (neuron_id * bundle_size) bytes into bundle_data
+    // But bundle_data may be offset from the layer start. For hot bundles, it's the
+    // absolute GPU pointer to the layer's bundle region. For cold bundles read into
+    // a buffer, bundle_data points to the start of the read range.
+    // We compute offsets relative to bundle_data.
+
+    // For the simple contiguous read approach:
+    // We need to know the base neuron that was read. For the hot case, base = 0
+    // (all bundles are in GPU memory). For cold, we read a contiguous range
+    // covering min_active..max_active, so base = min_active.
+
+    int min_active = e->host_active_ids[0];
+    int max_active = e->host_active_ids[0];
+    for (int i = 1; i < n_active; i++) {
+        if (e->host_active_ids[i] < min_active) min_active = e->host_active_ids[i];
+        if (e->host_active_ids[i] > max_active) max_active = e->host_active_ids[i];
+    }
+
+    // The bundle offsets are relative to bundle_data pointer
+    // For hot: bundle_data already points to neuron 0's bundle
+    // For cold: bundle_data points to min_active's bundle (start of the read range)
+    int base_neuron = 0; // hot case
+    // Check if this is a cold layer — cold layers have bundle_data pointing to
+    // a buffer starting at min_active, not neuron 0
+    if (!lp->is_hot) {
+        base_neuron = min_active;
+    }
+
+    // Build host-side offset array
+    int* host_offsets = (int*)e->host_active_ids; // reuse buffer temporarily? No, we still need IDs.
+    // Use a separate stack allocation since n_active is bounded by n_ff (~11k), ~44KB on stack is fine.
+    int* host_bundle_offsets = (int*)alloca(n_active * sizeof(int));
+    for (int i = 0; i < n_active; i++) {
+        host_bundle_offsets[i] = (e->host_active_ids[i] - base_neuron) * (int)e->bundle_size;
+    }
+
+    // Copy offsets to device
+    cudaMemcpy(e->dev_bundle_offsets, host_bundle_offsets, n_active * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch sparse FFN kernel
+    float* down_out = norm_out; // reuse scratch_a for output
+    jinf_cuda_sparse_ffn(bundle_data, norm_out, down_out,
+                          e->dev_bundle_offsets, n_active, n,
+                          (int)e->bundle_size, gate_qtype,
+                          e->sparse_gate_up_tmp, stream);
+
+    // 10. Residual add: hidden_state += down_out
+    jinf_cuda_residual_add(hidden_state, down_out, n, stream);
+
+    return JINF_OK;
+}
+
 // Process one layer with all weights hot (in GPU memory)
 static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_state) {
     jinf_layer_ptrs* lp = &e->layers[layer];
@@ -338,14 +465,38 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     // 7. Residual add: hidden_state += proj_out
     jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
 
-    // 8. FFN RMSNorm
+    // 8-10. FFN (sparse or dense)
+    if (e->sparse_enabled && jinf_nvmw_has_bundles(e->model)) {
+        // Sparse FFN: use neuron bundles from hot weights
+        // Hot bundle data for this layer: look up the layer's bundle region in GPU memory
+        const jinf_nvmw_bundle_layer_desc* bld = jinf_nvmw_get_bundle_layer_desc(e->model, layer);
+        if (bld && bld->bundles_offset > 0) {
+            // For hot layers, we need the bundle data in GPU memory.
+            // The bundles are appended after the cold region in the NVMW file.
+            // For hot layers, we need to pre-load bundles into GPU memory too.
+            // For MVP: read bundles from NVMe into the active buffer synchronously.
+            size_t range_size = (size_t)e->n_ff * e->bundle_size;
+            void* buf = jinf_buffer_active_ptr(e->buffers);
+            jinf_io_read_sync(e->io, e->fd_model, buf, bld->bundles_offset,
+                              JINF_ALIGN_4K(range_size));
+            return forward_layer_sparse_ffn(e, layer, hidden_state, buf, lp->ffn_gate_type);
+        }
+    }
+
+    // Dense FFN fallback
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, lp->ffn_norm_type, stream);
 
-    // 9. FFN: gate, up, SiLU, down
     float* gate_buf = scratch;
     float* up_buf = gate_buf + n_ff;
 
     jinf_cuda_dequant_matvec(lp->ffn_gate, norm_out, gate_buf, n_ff, n, lp->ffn_gate_type, stream);
+
+    // FFN profiling hook: capture raw gate output before SiLU
+    if (e->ffn_hook) {
+        cudaStreamSynchronize(stream);
+        e->ffn_hook(e->ffn_hook_data, layer, gate_buf, n_ff);
+    }
+
     jinf_cuda_dequant_matvec(lp->ffn_up, norm_out, up_buf, n_ff, n, lp->ffn_up_type, stream);
 
     jinf_cuda_silu_mul(gate_buf, gate_buf, up_buf, n_ff, stream);
@@ -450,13 +601,72 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
 
     jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
 
-    // 8-10. FFN
+    // 8-10. FFN (sparse or dense)
+    if (e->sparse_enabled && jinf_nvmw_has_bundles(e->model)) {
+        const jinf_nvmw_bundle_layer_desc* bld = jinf_nvmw_get_bundle_layer_desc(e->model, layer);
+        if (bld && bld->bundles_offset > 0) {
+            // Sparse FFN for cold layer: read only the needed neuron bundles
+            // First, predict which neurons are active (need norm_out for future MLP predictor)
+            jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, lp->ffn_norm_type, stream);
+            cudaStreamSynchronize(stream);
+            cudaMemcpy(e->host_hidden_state, norm_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+            int n_active = 0;
+            jinf_predictor_predict(e->predictor, e->host_hidden_state, layer,
+                                    e->host_active_ids, &n_active);
+
+            if (n_active > 0) {
+                // Find min/max active neuron for contiguous range read
+                int min_id = e->host_active_ids[0], max_id = e->host_active_ids[0];
+                for (int i = 1; i < n_active; i++) {
+                    if (e->host_active_ids[i] < min_id) min_id = e->host_active_ids[i];
+                    if (e->host_active_ids[i] > max_id) max_id = e->host_active_ids[i];
+                }
+
+                // Read contiguous range from min_id to max_id into buffer
+                uint64_t range_start = bld->bundles_offset + (uint64_t)min_id * bld->bundle_size;
+                size_t range_size = (size_t)(max_id - min_id + 1) * bld->bundle_size;
+                void* buf = jinf_buffer_active_ptr(e->buffers);
+                jinf_io_read_sync(e->io, e->fd_model, buf, range_start,
+                                  JINF_ALIGN_4K(range_size));
+
+                // Build bundle offsets relative to the read buffer
+                int* host_bundle_offsets = (int*)alloca(n_active * sizeof(int));
+                for (int i = 0; i < n_active; i++) {
+                    host_bundle_offsets[i] = (e->host_active_ids[i] - min_id) * (int)e->bundle_size;
+                }
+                cudaMemcpy(e->dev_bundle_offsets, host_bundle_offsets,
+                           n_active * sizeof(int), cudaMemcpyHostToDevice);
+
+                // Launch sparse FFN (norm_out already computed above)
+                float* down_out = norm_out;
+                jinf_cuda_sparse_ffn(buf, norm_out, down_out,
+                                      e->dev_bundle_offsets, n_active, n,
+                                      (int)e->bundle_size, qt_gate,
+                                      e->sparse_gate_up_tmp, stream);
+
+                jinf_cuda_residual_add(hidden_state, down_out, n, stream);
+                return JINF_OK;
+            }
+            // n_active == 0: skip FFN entirely
+            return JINF_OK;
+        }
+    }
+
+    // Dense FFN fallback
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, lp->ffn_norm_type, stream);
 
     float* gate_buf = scratch;
     float* up_buf = gate_buf + n_ff;
 
     jinf_cuda_dequant_matvec(ffn_gate, norm_out, gate_buf, n_ff, n, qt_gate, stream);
+
+    // FFN profiling hook: capture raw gate output before SiLU
+    if (e->ffn_hook) {
+        cudaStreamSynchronize(stream);
+        e->ffn_hook(e->ffn_hook_data, layer, gate_buf, n_ff);
+    }
+
     jinf_cuda_dequant_matvec(ffn_up, norm_out, up_buf, n_ff, n, qt_up, stream);
 
     jinf_cuda_silu_mul(gate_buf, gate_buf, up_buf, n_ff, stream);

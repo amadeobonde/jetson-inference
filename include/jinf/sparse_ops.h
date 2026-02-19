@@ -5,29 +5,36 @@
 #include <cstddef>
 #include <cuda_runtime.h>
 
-// ---- Phase 2: Sparse MatMul Interface ----
+// ---- Phase 2: Sparse FFN Interface ----
 //
 // Performs FFN computation using only activated neurons (gate/up/down),
-// reading from a mix of hot (GPU-resident) and cold (NVMe-streamed) bundles.
+// reading from neuron bundles (same format for hot and cold).
+//
+// Bundle layout per neuron:
+//   [gate_row: quantized n_embd values]
+//   [up_row: quantized n_embd values]
+//   [down_col: float32 n_embd values]  (dequantized during model prep)
+// Padded to 4K alignment.
 
-struct jinf_sparse_ffn_args {
-    const void*  neuron_bundles;     // packed cold neuron bundles from NVMe buffer
-    const void*  hot_bundles;        // hot neuron weights (GPU resident)
-    const float* input;              // hidden state [n_embd]
-    float*       output;             // output [n_embd]
-    const int*   neuron_ids;         // which neurons are activated (device mem)
-    const int*   is_hot;             // 1=hot, 0=cold per activated neuron (device mem)
-    const int*   cold_offsets;       // byte offset into neuron_bundles for each cold neuron
-    int          num_activated;
-    int          hidden_dim;         // n_embd
-    int          qtype;              // jinf_qtype of the weights
-    cudaStream_t stream;
-};
-
-// Launch sparse FFN forward pass on GPU.
-jinf_status jinf_sparse_ffn_forward(const jinf_sparse_ffn_args* args);
-
-// Dense mat-vec (for non-sparse layers like attention): y = x @ W^T
-// W is quantized [rows x cols], x is float [cols], y is float [rows].
-jinf_status jinf_dense_matvec(const void* weight, const float* input, float* output,
-                               int rows, int cols, int qtype, cudaStream_t stream);
+// Sparse FFN forward: processes only activated neurons.
+// bundles:        packed neuron bundles (GPU-accessible memory)
+// input:          hidden state [hidden_dim]
+// output:         output vector [hidden_dim] (will be zeroed, then accumulated)
+// bundle_offsets: byte offset within `bundles` for each activated neuron [num_activated]
+// num_activated:  number of active neurons
+// hidden_dim:     n_embd
+// bundle_size:    padded bytes per neuron bundle (runtime, not compiled-in)
+// qtype:          quantization type of gate/up rows (down is always float32)
+// gate_up_tmp:    pre-allocated GPU buffer [num_activated] for intermediate values
+// stream:         CUDA stream
+extern "C" void jinf_cuda_sparse_ffn(
+    const void* bundles,
+    const float* input,
+    float* output,
+    const int* bundle_offsets,
+    int num_activated,
+    int hidden_dim,
+    int bundle_size,
+    int qtype,
+    float* gate_up_tmp,
+    cudaStream_t stream);
