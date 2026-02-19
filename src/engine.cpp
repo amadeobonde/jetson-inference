@@ -305,13 +305,14 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     float* v_buf = k_buf + kv_dim;
 
     jinf_cuda_dequant_matvec(lp->attn_q, norm_out, q_buf, n, n, qtype, stream);
-    if (dbg) debug_gpu("L0 after_Q", q_buf, n, stream);
     jinf_cuda_dequant_matvec(lp->attn_k, norm_out, k_buf, kv_dim, n, qtype, stream);
     jinf_cuda_dequant_matvec(lp->attn_v, norm_out, v_buf, kv_dim, n, qtype, stream);
+    if (dbg) debug_gpu("L0 after_RoPE_Q", q_buf, n, stream);
 
     // 3. RoPE
     jinf_cuda_rope(q_buf, k_buf, head_dim, e->n_heads, e->n_heads_kv,
                     e->n_past, e->rope_freq_base, stream);
+    if (dbg) debug_gpu("L0 post_RoPE_Q", q_buf, n, stream);
 
     // 4. Store K, V into cache
     size_t kv_layer_stride = (size_t)e->max_context * kv_dim;
@@ -328,13 +329,16 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     jinf_cuda_attention(attn_out, q_buf, k_cache_layer, v_cache_layer,
                          head_dim, e->n_heads, e->n_heads_kv,
                          e->n_past + 1, e->max_context, stream);
+    if (dbg) debug_gpu("L0 after_attn", attn_out, n, stream);
 
     // 6. Output projection
     float* proj_out = scratch;
     jinf_cuda_dequant_matvec(lp->attn_output, attn_out, proj_out, n, n, qtype, stream);
+    if (dbg) debug_gpu("L0 after_attn_proj", proj_out, n, stream);
 
     // 7. Residual add: hidden_state += proj_out
     jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
+    if (dbg) debug_gpu("L0 after_attn_resid", hidden_state, n, stream);
 
     // 8. FFN RMSNorm
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, qtype, stream);
