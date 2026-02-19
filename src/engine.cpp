@@ -63,12 +63,11 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
     eng->primary_type = hdr->primary_type;
     eng->n_past       = 0;
 
-    JINF_LOG("Engine: %d layers, embd=%d, heads=%d/%d, ff=%d, vocab=%d, head_dim=%d",
+    JINF_LOG("Engine: %d layers, embd=%d, heads=%d/%d, ff=%d, vocab=%d, head_dim=%d, ctx=%d",
              eng->n_layers, eng->n_embd, eng->n_heads, eng->n_heads_kv,
-             eng->n_ff, eng->n_vocab, eng->head_dim);
+             eng->n_ff, eng->n_vocab, eng->head_dim, eng->max_context);
 
-    // Initialize CUDA context early — ensures driver/runtime are compatible
-    // before any allocations. cudaFree(0) is the canonical way to force init.
+    // Initialize CUDA context early
     JINF_CUDA_CHECK(cudaSetDevice(0));
     JINF_CUDA_CHECK(cudaFree(0));
 
@@ -125,7 +124,7 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
     }
     cudaFreeHost(staging);
 
-    // Build per-layer pointers
+    // Build per-layer pointers and types
     eng->layers = (jinf_layer_ptrs*)calloc(eng->n_layers, sizeof(jinf_layer_ptrs));
     if (!eng->layers) { jinf_engine_destroy(eng); return JINF_ERR_OOM; }
 
@@ -141,12 +140,11 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
         if (te->is_hot) {
             base_ptr = (char*)eng->hot_weights_gpu + te->offset;
         } else {
-            // Cold weights are loaded at runtime via double-buffer
-            continue;
+            continue; // Cold weights loaded at runtime
         }
 
         jinf_layer_ptrs* lp = &eng->layers[layer];
-        lp->is_hot = true;  // will be set false if any tensor is cold
+        lp->is_hot = true;
 
         if (strstr(te->name, "attn_norm.weight"))         { lp->attn_norm = base_ptr;   lp->attn_norm_type = te->type; }
         else if (strstr(te->name, "ffn_norm.weight"))      { lp->ffn_norm = base_ptr;    lp->ffn_norm_type = te->type; }
@@ -159,12 +157,35 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
         else if (strstr(te->name, "ffn_down.weight"))      { lp->ffn_down = base_ptr;    lp->ffn_down_type = te->type; }
     }
 
-    // Check which layers have cold tensors
+    // Mark layers with cold tensors
     for (int i = 0; i < n_entries; i++) {
         const jinf_nvmw_tensor_entry* te = &entries[i];
         if (!te->is_hot && te->layer_index >= 0 && te->layer_index < eng->n_layers) {
             eng->layers[te->layer_index].is_hot = false;
         }
+    }
+
+    // Cache embedding tensor info (avoid per-token lookup)
+    const jinf_nvmw_tensor_entry* embd = jinf_nvmw_find_tensor(eng->model, "token_embd.weight");
+    if (embd) {
+        eng->embed_type = embd->type;
+        jinf_qtype qt = (jinf_qtype)embd->type;
+        int block_size = jinf_qtype_block_size(qt);
+        eng->embed_n_blocks = (eng->n_embd + block_size - 1) / block_size;
+        eng->embed_row_bytes = (size_t)eng->embed_n_blocks * jinf_qtype_type_size(qt);
+        eng->embed_weight = (char*)eng->hot_weights_gpu + embd->offset;
+    }
+
+    // Cache output norm and output weight tensor info
+    const jinf_nvmw_tensor_entry* onorm = jinf_nvmw_find_tensor(eng->model, "output_norm.weight");
+    if (onorm) {
+        eng->output_norm_weight = (char*)eng->hot_weights_gpu + onorm->offset;
+        eng->output_norm_type = onorm->type;
+    }
+    const jinf_nvmw_tensor_entry* oweight = jinf_nvmw_find_tensor(eng->model, "output.weight");
+    if (oweight) {
+        eng->output_weight = (char*)eng->hot_weights_gpu + oweight->offset;
+        eng->output_weight_type = oweight->type;
     }
 
     // Allocate KV cache
@@ -187,6 +208,10 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
     JINF_CUDA_CHECK(cudaMalloc((void**)&eng->logits_buf, eng->n_vocab * sizeof(float)));
     JINF_CUDA_CHECK(cudaMalloc((void**)&eng->hidden_buf, eng->n_embd * sizeof(float)));
 
+    // Pre-allocate pinned host buffer for greedy sampling (avoids malloc/free per token)
+    JINF_CUDA_CHECK(cudaHostAlloc((void**)&eng->host_logits,
+                                   eng->n_vocab * sizeof(float), cudaHostAllocDefault));
+
     // Create compute stream
     JINF_CUDA_CHECK(cudaStreamCreate(&eng->compute_stream));
 
@@ -200,6 +225,7 @@ void jinf_engine_destroy(jinf_engine* e) {
     if (!e) return;
 
     if (e->compute_stream) cudaStreamDestroy(e->compute_stream);
+    if (e->host_logits) cudaFreeHost(e->host_logits);
     if (e->hidden_buf) cudaFree(e->hidden_buf);
     if (e->logits_buf) cudaFree(e->logits_buf);
     if (e->scratch_b) cudaFree(e->scratch_b);
@@ -233,50 +259,30 @@ const jinf_perf_stats* jinf_engine_get_stats(const jinf_engine* e) {
     return e ? &e->perf : nullptr;
 }
 
-// ---- Debug helper ----
-
-static void debug_gpu(const char* label, const float* gpu_ptr, int n, cudaStream_t stream) {
-    cudaStreamSynchronize(stream);
-    float tmp[8];
-    int cnt = std::min(n, 8);
-    cudaMemcpy(tmp, gpu_ptr, cnt * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("[DBG] %s:", label);
-    for (int i = 0; i < cnt; i++) printf(" %.6f", tmp[i]);
-    printf("\n");
-}
-
 // ---- Forward pass helpers ----
 
-// Get embedding for a token from hot weights
+// Get embedding for a token from hot weights (uses cached tensor info)
 static void embed_token(jinf_engine* e, int32_t token_id, float* out) {
-    const jinf_nvmw_tensor_entry* embd = jinf_nvmw_find_tensor(e->model, "token_embd.weight");
-    if (!embd) return;
+    const void* row_ptr = (const char*)e->embed_weight + (size_t)token_id * e->embed_row_bytes;
 
-    jinf_qtype qtype = (jinf_qtype)embd->type;
-    int block_size = jinf_qtype_block_size(qtype);
-    int n_blocks = (e->n_embd + block_size - 1) / block_size;
-    size_t row_bytes = (size_t)n_blocks * jinf_qtype_type_size(qtype);
-    const void* row_ptr = (const char*)e->hot_weights_gpu + embd->offset + (size_t)token_id * row_bytes;
-
-    switch (qtype) {
+    switch (e->embed_type) {
         case JINF_TYPE_Q4_0:
-            jinf_cuda_dequantize_q4_0(row_ptr, out, n_blocks, e->compute_stream);
+            jinf_cuda_dequantize_q4_0(row_ptr, out, e->embed_n_blocks, e->compute_stream);
             break;
         case JINF_TYPE_Q4_K:
-            jinf_cuda_dequantize_q4_K(row_ptr, out, n_blocks, e->compute_stream);
+            jinf_cuda_dequantize_q4_K(row_ptr, out, e->embed_n_blocks, e->compute_stream);
             break;
         case JINF_TYPE_Q8_0:
-            jinf_cuda_dequantize_q8_0(row_ptr, out, n_blocks, e->compute_stream);
+            jinf_cuda_dequantize_q8_0(row_ptr, out, e->embed_n_blocks, e->compute_stream);
             break;
         case JINF_TYPE_Q6_K:
-            jinf_cuda_dequantize_q6_K(row_ptr, out, n_blocks, e->compute_stream);
+            jinf_cuda_dequantize_q6_K(row_ptr, out, e->embed_n_blocks, e->compute_stream);
             break;
         case JINF_TYPE_F32:
             cudaMemcpyAsync(out, row_ptr, e->n_embd * sizeof(float),
                             cudaMemcpyDeviceToDevice, e->compute_stream);
             break;
         default:
-            JINF_LOG("embed_token: unsupported qtype %d", qtype);
             break;
     }
 }
@@ -288,22 +294,15 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     int n_ff = e->n_ff;
     int head_dim = e->head_dim;
     cudaStream_t stream = e->compute_stream;
-    bool dbg = (layer == 0 && e->n_past == 0);
 
     float* norm_out = e->scratch_a;
     float* scratch = e->scratch_b;
 
-    if (dbg) JINF_LOG("L0 types: q=%d k=%d v=%d out=%d gate=%d up=%d down=%d norm=%d fnorm=%d",
-                       lp->attn_q_type, lp->attn_k_type, lp->attn_v_type, lp->attn_output_type,
-                       lp->ffn_gate_type, lp->ffn_up_type, lp->ffn_down_type,
-                       lp->attn_norm_type, lp->ffn_norm_type);
-
     // 1. Attention RMSNorm
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->attn_norm, n, e->rms_norm_eps, lp->attn_norm_type, stream);
-    if (dbg) debug_gpu("L0 after_rmsnorm", norm_out, n, stream);
 
     // 2. Q, K, V projections (each may have different quantization type)
-    float* q_buf = scratch;  // reuse scratch
+    float* q_buf = scratch;
     float* k_buf = q_buf + n;
     int kv_dim = e->n_heads_kv * head_dim;
     float* v_buf = k_buf + kv_dim;
@@ -311,10 +310,6 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     jinf_cuda_dequant_matvec(lp->attn_q, norm_out, q_buf, n, n, lp->attn_q_type, stream);
     jinf_cuda_dequant_matvec(lp->attn_k, norm_out, k_buf, kv_dim, n, lp->attn_k_type, stream);
     jinf_cuda_dequant_matvec(lp->attn_v, norm_out, v_buf, kv_dim, n, lp->attn_v_type, stream);
-    if (dbg) {
-        debug_gpu("L0 V_proj", v_buf, kv_dim, stream);
-        debug_gpu("L0 K_proj", k_buf, kv_dim, stream);
-    }
 
     // 3. RoPE
     jinf_cuda_rope(q_buf, k_buf, head_dim, e->n_heads, e->n_heads_kv,
@@ -330,27 +325,18 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     cudaMemcpyAsync(v_cache_layer + (size_t)e->n_past * kv_dim, v_buf,
                      kv_dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
-    if (dbg) {
-        debug_gpu("L0 V_cache", v_cache_layer, kv_dim, stream);
-        JINF_LOG("attn args: n_past=%d, head_dim=%d, n_heads=%d, n_kv=%d, max_ctx=%d, kv_stride=%zu",
-                  e->n_past + 1, head_dim, e->n_heads, e->n_heads_kv, e->max_context, kv_layer_stride);
-    }
-
     // 5. Attention: Q @ K^T, softmax, @ V
-    float* attn_out = norm_out;  // reuse
+    float* attn_out = norm_out;
     jinf_cuda_attention(attn_out, q_buf, k_cache_layer, v_cache_layer,
                          head_dim, e->n_heads, e->n_heads_kv,
                          e->n_past + 1, e->max_context, stream);
-    if (dbg) debug_gpu("L0 after_attn", attn_out, n, stream);
 
     // 6. Output projection
     float* proj_out = scratch;
     jinf_cuda_dequant_matvec(lp->attn_output, attn_out, proj_out, n, n, lp->attn_output_type, stream);
-    if (dbg) debug_gpu("L0 after_attn_proj", proj_out, n, stream);
 
     // 7. Residual add: hidden_state += proj_out
     jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
-    if (dbg) debug_gpu("L0 after_attn_resid", hidden_state, n, stream);
 
     // 8. FFN RMSNorm
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, lp->ffn_norm_type, stream);
@@ -362,10 +348,8 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     jinf_cuda_dequant_matvec(lp->ffn_gate, norm_out, gate_buf, n_ff, n, lp->ffn_gate_type, stream);
     jinf_cuda_dequant_matvec(lp->ffn_up, norm_out, up_buf, n_ff, n, lp->ffn_up_type, stream);
 
-    // SiLU(gate) * up
     jinf_cuda_silu_mul(gate_buf, gate_buf, up_buf, n_ff, stream);
 
-    // down projection
     float* down_out = norm_out;
     jinf_cuda_dequant_matvec(lp->ffn_down, gate_buf, down_out, n, n_ff, lp->ffn_down_type, stream);
 
@@ -387,12 +371,10 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     float* norm_out = e->scratch_a;
     float* scratch = e->scratch_b;
 
-    // Parse cold buffer: tensors are packed contiguously per layer
-    // We need to find the offset and type of each tensor within the cold buffer
+    // Parse cold buffer: find offset and type of each tensor
     int n_entries = 0;
     const jinf_nvmw_tensor_entry* entries = jinf_nvmw_get_tensor_entries(e->model, &n_entries);
 
-    // Build pointers and types from cold buffer
     void* cold_attn_q = nullptr;       int cold_attn_q_type = 0;
     void* cold_attn_k = nullptr;       int cold_attn_k_type = 0;
     void* cold_attn_v = nullptr;       int cold_attn_v_type = 0;
@@ -401,15 +383,10 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     void* cold_ffn_up = nullptr;       int cold_ffn_up_type = 0;
     void* cold_ffn_down = nullptr;     int cold_ffn_down_type = 0;
 
-    uint64_t layer_cold_offset = 0;
-    uint64_t layer_cold_size = 0;
-    jinf_nvmw_get_layer_cold_range(e->model, layer, &layer_cold_offset, &layer_cold_size);
-
     for (int i = 0; i < n_entries; i++) {
         const jinf_nvmw_tensor_entry* te = &entries[i];
         if (te->is_hot || te->layer_index != layer) continue;
 
-        // te->offset is relative to the cold region start for this layer
         void* ptr = (char*)cold_buffer + te->offset;
 
         if (strstr(te->name, "attn_q.weight"))             { cold_attn_q = ptr;      cold_attn_q_type = te->type; }
@@ -438,13 +415,10 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     int qt_up   = cold_ffn_up     ? cold_ffn_up_type       : lp->ffn_up_type;
     int qt_down = cold_ffn_down   ? cold_ffn_down_type     : lp->ffn_down_type;
 
-    // Same computation as hot layer, but using cold pointers
-    // (On Jetson, the cold_buffer is pinned memory — GPU can read it directly)
-
     // 1. Attention RMSNorm (norm weight is always hot)
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->attn_norm, n, e->rms_norm_eps, lp->attn_norm_type, stream);
 
-    // 2-6. Attention (same as hot, per-tensor types)
+    // 2-6. Attention
     float* q_buf = scratch;
     float* k_buf = q_buf + n;
     int kv_dim = e->n_heads_kv * head_dim;
@@ -474,10 +448,9 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     float* proj_out = scratch;
     jinf_cuda_dequant_matvec(attn_output, attn_out, proj_out, n, n, qt_out, stream);
 
-    // Residual add
     jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
 
-    // 8-10. FFN (same as hot but with cold pointers, per-tensor types)
+    // 8-10. FFN
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, lp->ffn_norm_type, stream);
 
     float* gate_buf = scratch;
@@ -491,7 +464,6 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     float* down_out = norm_out;
     jinf_cuda_dequant_matvec(ffn_down, gate_buf, down_out, n, n_ff, qt_down, stream);
 
-    // Residual add
     jinf_cuda_residual_add(hidden_state, down_out, n, stream);
 
     return JINF_OK;
@@ -508,29 +480,16 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
 
     // Process tokens one at a time for decode (MVP)
     for (int t = 0; t < n_tokens; t++) {
-        int32_t token_id = tokens[t];
-
         // 1. Embed token
-        embed_token(e, token_id, hidden_state);
-        if (t == 0) {
-            const jinf_nvmw_tensor_entry* embd = jinf_nvmw_find_tensor(e->model, "token_embd.weight");
-            JINF_LOG("embed: token=%d, type=%d (%s), offset=%lu",
-                     token_id, embd ? embd->type : -1,
-                     embd ? jinf_qtype_name((jinf_qtype)embd->type) : "??",
-                     embd ? (unsigned long)embd->offset : 0);
-            debug_gpu("after_embed", hidden_state, e->n_embd, e->compute_stream);
-        }
+        embed_token(e, tokens[t], hidden_state);
 
         // 2. Process each layer
         for (int L = 0; L < e->n_layers; L++) {
             if (e->layers[L].is_hot) {
-                // All weights in GPU memory — fast path
                 jinf_status s = forward_layer_hot(e, L, hidden_state);
                 if (s != JINF_OK) return s;
-                if (t == 0 && L == 0) debug_gpu("after_layer0", hidden_state, e->n_embd, e->compute_stream);
             } else {
-                // Cold layer — need NVMe double-buffer pipeline
-                // Start prefetch for next cold layer
+                // Cold layer — NVMe double-buffer pipeline
                 int next_cold = -1;
                 for (int j = L + 1; j < e->n_layers; j++) {
                     if (!e->layers[j].is_hot) { next_cold = j; break; }
@@ -544,21 +503,17 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
                                             next_offset, (size_t)next_size);
                 }
 
-                // Wait for current layer's data
                 void* cold_ptr = nullptr;
                 size_t cold_size = 0;
 
                 if (L == 0 || e->layers[L - 1].is_hot) {
-                    // First cold layer — need to do a synchronous read
                     uint64_t offset, size;
                     jinf_nvmw_get_layer_cold_range(e->model, L, &offset, &size);
-
                     void* buf = jinf_buffer_active_ptr(e->buffers);
                     jinf_io_read_sync(e->io, e->fd_model, buf, offset, size);
                     cold_ptr = buf;
                     cold_size = (size_t)size;
                 } else {
-                    // Data was prefetched — wait and get
                     jinf_buffer_wait_read(e->buffers, e->io, &cold_ptr, &cold_size);
                     jinf_buffer_swap(e->buffers);
                 }
@@ -569,28 +524,17 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
         }
 
         // 3. Final RMSNorm
-        const jinf_nvmw_tensor_entry* output_norm =
-            jinf_nvmw_find_tensor(e->model, "output_norm.weight");
-        if (output_norm) {
-            void* norm_weight = (char*)e->hot_weights_gpu + output_norm->offset;
-            jinf_cuda_rmsnorm(hidden_state, hidden_state, norm_weight,
-                               e->n_embd, e->rms_norm_eps, output_norm->type,
+        if (e->output_norm_weight) {
+            jinf_cuda_rmsnorm(hidden_state, hidden_state, e->output_norm_weight,
+                               e->n_embd, e->rms_norm_eps, e->output_norm_type,
                                e->compute_stream);
         }
 
         // 4. Output projection: logits = hidden_state @ output_weight
-        const jinf_nvmw_tensor_entry* output_weight =
-            jinf_nvmw_find_tensor(e->model, "output.weight");
-        if (output_weight) {
-            void* out_w = (char*)e->hot_weights_gpu + output_weight->offset;
-            jinf_cuda_dequant_matvec(out_w, hidden_state, e->logits_buf,
-                                      e->n_vocab, e->n_embd, output_weight->type,
+        if (e->output_weight) {
+            jinf_cuda_dequant_matvec(e->output_weight, hidden_state, e->logits_buf,
+                                      e->n_vocab, e->n_embd, e->output_weight_type,
                                       e->compute_stream);
-        }
-
-        if (t == 0) {
-            debug_gpu("after_all_layers", hidden_state, e->n_embd, e->compute_stream);
-            debug_gpu("logits", e->logits_buf, e->n_vocab, e->compute_stream);
         }
 
         e->n_past++;
@@ -616,29 +560,24 @@ jinf_status jinf_engine_generate(jinf_engine* e, const int32_t* prompt, int n_pr
         jinf_status s = jinf_engine_forward(e, prompt, n_prompt, &logits);
         if (s != JINF_OK) return s;
     } else {
-        // Use logits already computed by a prior forward call
-        if (e->n_past == 0) return JINF_ERR_INVALID;  // no prior forward
+        if (e->n_past == 0) return JINF_ERR_INVALID;
         logits = e->logits_buf;
     }
 
     int generated = 0;
 
     for (int i = 0; i < max_tokens; i++) {
-        // Greedy sampling: argmax of logits
-        float* host_logits = (float*)malloc(e->n_vocab * sizeof(float));
-        if (!host_logits) return JINF_ERR_OOM;
-
-        cudaMemcpy(host_logits, logits, e->n_vocab * sizeof(float), cudaMemcpyDeviceToHost);
+        // Greedy sampling: argmax of logits (uses pre-allocated pinned buffer)
+        cudaMemcpy(e->host_logits, logits, e->n_vocab * sizeof(float), cudaMemcpyDeviceToHost);
 
         int best_id = 0;
-        float best_val = host_logits[0];
+        float best_val = e->host_logits[0];
         for (int j = 1; j < e->n_vocab; j++) {
-            if (host_logits[j] > best_val) {
-                best_val = host_logits[j];
+            if (e->host_logits[j] > best_val) {
+                best_val = e->host_logits[j];
                 best_id = j;
             }
         }
-        free(host_logits);
 
         output[generated++] = best_id;
 

@@ -22,7 +22,7 @@ static bool parse_args(int argc, char** argv, bench_args* args) {
     args->max_tokens = 32;
     args->max_context = 512;
     args->gpu_budget_mb = 4500;
-    args->buffer_mb = 512;
+    args->buffer_mb = 128;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {

@@ -34,8 +34,8 @@ static inline jinf_engine_config jinf_engine_config_default() {
     return {
         .model_path       = nullptr,
         .gpu_memory_budget = (size_t)4500 * 1024 * 1024,
-        .buffer_capacity   = (size_t)512 * 1024 * 1024,
-        .max_context       = 2048,
+        .buffer_capacity   = (size_t)128 * 1024 * 1024,
+        .max_context       = 512,
         .io_queue_depth    = 64,
     };
 }
@@ -97,6 +97,17 @@ struct jinf_engine {
     float* scratch_b;
     float* logits_buf;
     float* hidden_buf;    // dedicated hidden state buffer [n_embd]
+    float* host_logits;   // pinned host buffer for greedy sampling [n_vocab]
+
+    // Cached tensor pointers (avoid per-token linear scans)
+    void*   embed_weight;      // token_embd.weight in hot_weights_gpu
+    int32_t embed_type;        // quantization type of embedding
+    size_t  embed_row_bytes;   // bytes per embedding row
+    int     embed_n_blocks;    // dequant blocks per row
+    void*   output_norm_weight; // output_norm.weight in hot_weights_gpu
+    int32_t output_norm_type;
+    void*   output_weight;     // output.weight in hot_weights_gpu
+    int32_t output_weight_type;
 
     // State
     int n_past;           // current KV cache position
