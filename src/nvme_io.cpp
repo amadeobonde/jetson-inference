@@ -104,13 +104,8 @@ jinf_status jinf_io_submit(jinf_io_context* ctx, const jinf_io_request* reqs, in
             return JINF_ERR_IO;
         }
 
-        // Use a single iovec for each request
-        // We store the iovec in the user_data area by wrapping the request
-        struct iovec iov;
-        iov.iov_base = reqs[i].buffer;
-        iov.iov_len = reqs[i].length;
-
-        io_uring_prep_readv(sqe, reqs[i].fd, &iov, 1, reqs[i].offset);
+        io_uring_prep_read(sqe, reqs[i].fd, reqs[i].buffer,
+                           (unsigned)reqs[i].length, reqs[i].offset);
         io_uring_sqe_set_data(sqe, reqs[i].user_data);
     }
 
