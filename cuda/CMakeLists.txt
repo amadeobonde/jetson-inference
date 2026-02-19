@@ -21,7 +21,6 @@ target_link_libraries(jinf_cuda PUBLIC
 )
 
 set_target_properties(jinf_cuda PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES 87
     POSITION_INDEPENDENT_CODE ON
 )
