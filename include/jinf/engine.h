@@ -85,6 +85,7 @@ struct jinf_engine {
     float* scratch_a;
     float* scratch_b;
     float* logits_buf;
+    float* hidden_buf;    // dedicated hidden state buffer [n_embd]
 
     // State
     int n_past;           // current KV cache position

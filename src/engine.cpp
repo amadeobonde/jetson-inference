@@ -22,6 +22,10 @@ void jinf_cuda_attention(float* output, const float* q, const float* k_cache,
                           const float* v_cache, int head_dim, int n_heads,
                           int n_heads_kv, int n_past, int max_ctx,
                           cudaStream_t stream);
+void jinf_cuda_dequantize_q4_0(const void* data, float* output, int n_blocks, cudaStream_t stream);
+void jinf_cuda_dequantize_q4_K(const void* data, float* output, int n_blocks, cudaStream_t stream);
+void jinf_cuda_dequantize_q8_0(const void* data, float* output, int n_blocks, cudaStream_t stream);
+void jinf_cuda_residual_add(float* a, const float* b, int n, cudaStream_t stream);
 }
 
 // ---- Helpers ----
@@ -180,6 +184,7 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
     JINF_CUDA_CHECK(cudaMalloc((void**)&eng->scratch_a, scratch_size));
     JINF_CUDA_CHECK(cudaMalloc((void**)&eng->scratch_b, scratch_size));
     JINF_CUDA_CHECK(cudaMalloc((void**)&eng->logits_buf, eng->n_vocab * sizeof(float)));
+    JINF_CUDA_CHECK(cudaMalloc((void**)&eng->hidden_buf, eng->n_embd * sizeof(float)));
 
     // Create compute stream
     JINF_CUDA_CHECK(cudaStreamCreate(&eng->compute_stream));
@@ -194,6 +199,7 @@ void jinf_engine_destroy(jinf_engine* e) {
     if (!e) return;
 
     if (e->compute_stream) cudaStreamDestroy(e->compute_stream);
+    if (e->hidden_buf) cudaFree(e->hidden_buf);
     if (e->logits_buf) cudaFree(e->logits_buf);
     if (e->scratch_b) cudaFree(e->scratch_b);
     if (e->scratch_a) cudaFree(e->scratch_a);
@@ -230,25 +236,33 @@ const jinf_perf_stats* jinf_engine_get_stats(const jinf_engine* e) {
 
 // Get embedding for a token from hot weights
 static void embed_token(jinf_engine* e, int32_t token_id, float* out) {
-    // token_embd.weight is always hot — find it
     const jinf_nvmw_tensor_entry* embd = jinf_nvmw_find_tensor(e->model, "token_embd.weight");
     if (!embd) return;
 
-    size_t row_bytes = jinf_tensor_nbytes((jinf_qtype)embd->type, e->n_embd);
+    jinf_qtype qtype = (jinf_qtype)embd->type;
+    int block_size = jinf_qtype_block_size(qtype);
+    int n_blocks = (e->n_embd + block_size - 1) / block_size;
+    size_t row_bytes = (size_t)n_blocks * jinf_qtype_type_size(qtype);
     const void* row_ptr = (const char*)e->hot_weights_gpu + embd->offset + (size_t)token_id * row_bytes;
 
-    // Dequantize on GPU to get float embedding
-    jinf_cuda_dequant_matvec(nullptr, nullptr, nullptr, 0, 0, 0, 0);  // placeholder
-    // For MVP: just copy the quantized row and dequant
-    // The actual embedding lookup is a special case — for Q4_K, we dequantize one row
-    // For simplicity in MVP, treat as a matvec with a one-hot input
-    // Actually, we need a dedicated embedding lookup kernel
-    // For now, use cudaMemcpy + CPU dequant as fallback
-
-    // MVP: GPU-side embedding lookup
-    // The embedding weight is [n_vocab x n_embd], we want row token_id
-    // We'll dequantize on-the-fly using the dequant_matvec with identity
-    // This is handled in the actual CUDA kernel as a special case
+    switch (qtype) {
+        case JINF_TYPE_Q4_0:
+            jinf_cuda_dequantize_q4_0(row_ptr, out, n_blocks, e->compute_stream);
+            break;
+        case JINF_TYPE_Q4_K:
+            jinf_cuda_dequantize_q4_K(row_ptr, out, n_blocks, e->compute_stream);
+            break;
+        case JINF_TYPE_Q8_0:
+            jinf_cuda_dequantize_q8_0(row_ptr, out, n_blocks, e->compute_stream);
+            break;
+        case JINF_TYPE_F32:
+            cudaMemcpyAsync(out, row_ptr, e->n_embd * sizeof(float),
+                            cudaMemcpyDeviceToDevice, e->compute_stream);
+            break;
+        default:
+            JINF_LOG("embed_token: unsupported qtype %d", qtype);
+            break;
+    }
 }
 
 // Process one layer with all weights hot (in GPU memory)
@@ -301,10 +315,7 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     jinf_cuda_dequant_matvec(lp->attn_output, attn_out, proj_out, n, n, qtype, stream);
 
     // 7. Residual add: hidden_state += proj_out
-    // (simple kernel or cublas saxpy)
-    // For MVP, we'll launch a simple element-wise add kernel
-    // hidden_state[i] += proj_out[i]
-    // This is handled inline by a tiny CUDA kernel (defined elsewhere)
+    jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
 
     // 8. FFN RMSNorm
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, qtype, stream);
@@ -324,7 +335,7 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     jinf_cuda_dequant_matvec(lp->ffn_down, gate_buf, down_out, n, n_ff, qtype, stream);
 
     // 10. Residual add: hidden_state += down_out
-    // (handled by residual add kernel)
+    jinf_cuda_residual_add(hidden_state, down_out, n, stream);
 
     return JINF_OK;
 }
@@ -422,6 +433,7 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     jinf_cuda_dequant_matvec(attn_output, attn_out, proj_out, n, n, qtype, stream);
 
     // Residual add
+    jinf_cuda_residual_add(hidden_state, proj_out, n, stream);
 
     // 8-10. FFN (same as hot but with cold pointers)
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->ffn_norm, n, e->rms_norm_eps, qtype, stream);
@@ -438,6 +450,7 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     jinf_cuda_dequant_matvec(ffn_down, gate_buf, down_out, n, n_ff, qtype, stream);
 
     // Residual add
+    jinf_cuda_residual_add(hidden_state, down_out, n, stream);
 
     return JINF_OK;
 }
@@ -449,7 +462,7 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
     if (!e || !tokens || n_tokens <= 0 || !logits) return JINF_ERR_INVALID;
 
     jinf_timer timer;
-    float* hidden_state = e->scratch_a;
+    float* hidden_state = e->hidden_buf;
 
     // Process tokens one at a time for decode (MVP)
     for (int t = 0; t < n_tokens; t++) {
