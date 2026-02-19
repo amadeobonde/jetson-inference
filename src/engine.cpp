@@ -455,6 +455,18 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     return JINF_OK;
 }
 
+// ---- Debug helper ----
+
+static void debug_gpu(const char* label, const float* gpu_ptr, int n, cudaStream_t stream) {
+    cudaStreamSynchronize(stream);
+    float tmp[8];
+    int cnt = std::min(n, 8);
+    cudaMemcpy(tmp, gpu_ptr, cnt * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("[DBG] %s:", label);
+    for (int i = 0; i < cnt; i++) printf(" %.6f", tmp[i]);
+    printf("\n");
+}
+
 // ---- Forward pass ----
 
 jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tokens,
@@ -470,6 +482,14 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
 
         // 1. Embed token
         embed_token(e, token_id, hidden_state);
+        if (t == 0) {
+            const jinf_nvmw_tensor_entry* embd = jinf_nvmw_find_tensor(e->model, "token_embd.weight");
+            JINF_LOG("embed: token=%d, type=%d (%s), offset=%lu",
+                     token_id, embd ? embd->type : -1,
+                     embd ? jinf_qtype_name((jinf_qtype)embd->type) : "??",
+                     embd ? (unsigned long)embd->offset : 0);
+            debug_gpu("after_embed", hidden_state, e->n_embd, e->compute_stream);
+        }
 
         // 2. Process each layer
         for (int L = 0; L < e->n_layers; L++) {
@@ -477,6 +497,7 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
                 // All weights in GPU memory — fast path
                 jinf_status s = forward_layer_hot(e, L, hidden_state);
                 if (s != JINF_OK) return s;
+                if (t == 0 && L == 0) debug_gpu("after_layer0", hidden_state, e->n_embd, e->compute_stream);
             } else {
                 // Cold layer — need NVMe double-buffer pipeline
                 // Start prefetch for next cold layer
@@ -535,6 +556,11 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
             jinf_cuda_dequant_matvec(out_w, hidden_state, e->logits_buf,
                                       e->n_vocab, e->n_embd, e->primary_type,
                                       e->compute_stream);
+        }
+
+        if (t == 0) {
+            debug_gpu("after_all_layers", hidden_state, e->n_embd, e->compute_stream);
+            debug_gpu("logits", e->logits_buf, e->n_vocab, e->compute_stream);
         }
 
         e->n_past++;
