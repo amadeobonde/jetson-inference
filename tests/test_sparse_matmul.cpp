@@ -16,12 +16,8 @@ static int test_placeholder() {
 
     // Phase 2 test placeholder.
     // Full test requires neuron-bundled data and CUDA device.
-    // Verify the header compiles and basic types are correct.
-
-    jinf_sparse_ffn_args args;
-    memset(&args, 0, sizeof(args));
-    assert(args.num_activated == 0);
-    assert(args.hidden_dim == 0);
+    // Verify the header compiles and the function symbol is declared.
+    (void)jinf_cuda_sparse_ffn;
 
     printf("    PASSED (placeholder — Phase 2)\n");
     return 0;
