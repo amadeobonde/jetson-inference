@@ -273,12 +273,18 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     int head_dim = e->head_dim;
     int qtype = e->primary_type;
     cudaStream_t stream = e->compute_stream;
+    bool dbg = (layer == 0 && e->n_past == 0);
 
     float* norm_out = e->scratch_a;
     float* scratch = e->scratch_b;
 
+    if (dbg) JINF_LOG("L0 ptrs: attn_norm=%p attn_q=%p attn_k=%p attn_v=%p attn_out=%p ffn_norm=%p gate=%p up=%p down=%p",
+                       lp->attn_norm, lp->attn_q, lp->attn_k, lp->attn_v, lp->attn_output,
+                       lp->ffn_norm, lp->ffn_gate, lp->ffn_up, lp->ffn_down);
+
     // 1. Attention RMSNorm
     jinf_cuda_rmsnorm(norm_out, hidden_state, lp->attn_norm, n, e->rms_norm_eps, qtype, stream);
+    if (dbg) debug_gpu("L0 after_rmsnorm", norm_out, n, stream);
 
     // 2. Q, K, V projections
     float* q_buf = scratch;  // reuse scratch
@@ -287,6 +293,7 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     float* v_buf = k_buf + kv_dim;
 
     jinf_cuda_dequant_matvec(lp->attn_q, norm_out, q_buf, n, n, qtype, stream);
+    if (dbg) debug_gpu("L0 after_Q", q_buf, n, stream);
     jinf_cuda_dequant_matvec(lp->attn_k, norm_out, k_buf, kv_dim, n, qtype, stream);
     jinf_cuda_dequant_matvec(lp->attn_v, norm_out, v_buf, kv_dim, n, qtype, stream);
 
