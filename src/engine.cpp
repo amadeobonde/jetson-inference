@@ -538,12 +538,19 @@ jinf_status jinf_engine_forward(jinf_engine* e, const int32_t* tokens, int n_tok
 
 jinf_status jinf_engine_generate(jinf_engine* e, const int32_t* prompt, int n_prompt,
                                   int32_t* output, int max_tokens, int* n_generated) {
-    if (!e || !prompt || !output || !n_generated) return JINF_ERR_INVALID;
+    if (!e || !output || !n_generated) return JINF_ERR_INVALID;
 
-    // Process prompt
+    // Process prompt (or skip if n_prompt=0, using existing logits from prior forward)
     float* logits = nullptr;
-    jinf_status s = jinf_engine_forward(e, prompt, n_prompt, &logits);
-    if (s != JINF_OK) return s;
+    if (n_prompt > 0) {
+        if (!prompt) return JINF_ERR_INVALID;
+        jinf_status s = jinf_engine_forward(e, prompt, n_prompt, &logits);
+        if (s != JINF_OK) return s;
+    } else {
+        // Use logits already computed by a prior forward call
+        if (e->n_past == 0) return JINF_ERR_INVALID;  // no prior forward
+        logits = e->logits_buf;
+    }
 
     int generated = 0;
 
@@ -570,8 +577,8 @@ jinf_status jinf_engine_generate(jinf_engine* e, const int32_t* prompt, int n_pr
         if (best_id == 2) break;
 
         // Feed the generated token back
-        s = jinf_engine_forward(e, &best_id, 1, &logits);
-        if (s != JINF_OK) break;
+        jinf_status ds = jinf_engine_forward(e, &best_id, 1, &logits);
+        if (ds != JINF_OK) break;
     }
 
     *n_generated = generated;
