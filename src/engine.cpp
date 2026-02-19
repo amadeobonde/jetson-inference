@@ -232,6 +232,18 @@ const jinf_perf_stats* jinf_engine_get_stats(const jinf_engine* e) {
     return e ? &e->perf : nullptr;
 }
 
+// ---- Debug helper ----
+
+static void debug_gpu(const char* label, const float* gpu_ptr, int n, cudaStream_t stream) {
+    cudaStreamSynchronize(stream);
+    float tmp[8];
+    int cnt = std::min(n, 8);
+    cudaMemcpy(tmp, gpu_ptr, cnt * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("[DBG] %s:", label);
+    for (int i = 0; i < cnt; i++) printf(" %.6f", tmp[i]);
+    printf("\n");
+}
+
 // ---- Forward pass helpers ----
 
 // Get embedding for a token from hot weights
@@ -460,18 +472,6 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
     jinf_cuda_residual_add(hidden_state, down_out, n, stream);
 
     return JINF_OK;
-}
-
-// ---- Debug helper ----
-
-static void debug_gpu(const char* label, const float* gpu_ptr, int n, cudaStream_t stream) {
-    cudaStreamSynchronize(stream);
-    float tmp[8];
-    int cnt = std::min(n, 8);
-    cudaMemcpy(tmp, gpu_ptr, cnt * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("[DBG] %s:", label);
-    for (int i = 0; i < cnt; i++) printf(" %.6f", tmp[i]);
-    printf("\n");
 }
 
 // ---- Forward pass ----
