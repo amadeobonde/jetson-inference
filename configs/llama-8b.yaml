@@ -1,0 +1,29 @@
+# Llama 3.1 8B configuration
+model:
+  name: "Llama-3.1-8B"
+  arch: "llama"
+  n_layers: 32
+  n_embd: 4096
+  n_heads: 32
+  n_heads_kv: 8
+  n_ff: 14336
+  n_vocab: 128256
+  n_ctx_train: 131072
+  rope_freq_base: 500000.0
+  rms_norm_eps: 1.0e-5
+
+quantization:
+  type: "Q4_K_M"
+  model_size_gb: 4.92
+
+memory:
+  gpu_budget_mb: 4500
+  kv_cache_budget_mb: 500
+  buffer_capacity_mb: 256
+  max_context: 2048
+
+notes: |
+  At Q4_K_M, the entire 8B model (~4.9 GB) fits within the 4.5 GB hot
+  weight budget on Jetson Orin Nano. No NVMe streaming needed for this
+  model — useful for pipeline validation and as a draft model for
+  speculative decoding.

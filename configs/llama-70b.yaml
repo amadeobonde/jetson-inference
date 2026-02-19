@@ -1,0 +1,38 @@
+# Llama 3.1 70B configuration
+model:
+  name: "Llama-3.1-70B"
+  arch: "llama"
+  n_layers: 80
+  n_embd: 8192
+  n_heads: 64
+  n_heads_kv: 8
+  n_ff: 28672
+  n_vocab: 128256
+  n_ctx_train: 131072
+  rope_freq_base: 500000.0
+  rms_norm_eps: 1.0e-5
+
+quantization:
+  type: "Q4_K_M"
+  model_size_gb: 39.6
+
+memory:
+  gpu_budget_mb: 3000
+  kv_cache_budget_mb: 1000
+  buffer_capacity_mb: 512
+  max_context: 2048
+
+phase1:
+  notes: |
+    Full-layer streaming: ~598 MB cold per layer, 80 layers.
+    ~20 sec/token (~0.05 tok/sec) — NVMe-bound.
+    Hot weights: embeddings (~1 GB) + norms + output weight.
+
+phase2:
+  notes: |
+    Sparse FFN with ~15% neuron activation.
+    Cold FFN per layer: ~64 MB (vs ~450 MB dense).
+    Target: 0.3-0.5 tok/sec with hot attention for some layers.
+  neuron_bundle_size_kb: 16
+  expected_activation_rate: 0.15
+  hot_neuron_fraction: 0.05

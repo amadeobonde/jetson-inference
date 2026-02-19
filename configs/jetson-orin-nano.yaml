@@ -1,0 +1,35 @@
+# NVIDIA Jetson Orin Nano Super hardware profile
+hardware:
+  name: "Jetson Orin Nano Super"
+  ram_total_mb: 8192
+  ram_type: "LPDDR5"
+  ram_shared: true  # CPU/GPU shared memory
+
+  gpu:
+    name: "Ampere"
+    sm_version: 87
+    cuda_cores: 1024
+    max_freq_mhz: 1020
+    fp32_tflops: 2.1
+    memory_shared: true  # no dedicated VRAM
+
+  nvme:
+    interface: "PCIe Gen3 x4"
+    theoretical_gbps: 3.5
+    practical_gbps: 2.4
+    device: "SK Hynix P41 1TB"
+
+memory_budget:
+  os_cuda_mb: 1000
+  hot_weights_8b_mb: 4500
+  hot_weights_70b_mb: 3000
+  kv_cache_8b_mb: 500
+  kv_cache_70b_mb: 1000
+  double_buffer_mb: 1024
+  scratch_mb: 500
+
+notes: |
+  Key advantage: unified memory architecture means cudaHostAlloc
+  buffers are directly GPU-accessible (zero-copy). No explicit
+  H2D memcpy needed — the GPU reads from pinned host memory directly.
+  This eliminates PCIe transfer overhead typical on discrete GPU systems.
