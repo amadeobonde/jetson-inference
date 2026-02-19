@@ -4,7 +4,7 @@
 #include "jinf/nvmw.h"
 #include "jinf/nvme_io.h"
 #include "jinf/buffer_pool.h"
-#include "jinf/predictor.h"
+#include "jinf/activation_predictor.h"
 #include <cstdint>
 #include <cstddef>
 #include <cuda_runtime.h>

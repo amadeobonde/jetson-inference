@@ -226,8 +226,8 @@ jinf_status jinf_engine_create(jinf_engine** e, const jinf_engine_config* config
     eng->bundle_size = 0;
 
     if (config->predictor_path && jinf_nvmw_has_bundles(eng->model)) {
-        s = jinf_predictor_create(&eng->predictor, config->predictor_path,
-                                   config->sparsity_threshold);
+        s = jinf_predictor_create_static(&eng->predictor, config->predictor_path,
+                                         config->sparsity_threshold);
         if (s == JINF_OK) {
             // Allocate sparse FFN buffers
             JINF_CUDA_CHECK(cudaMalloc((void**)&eng->sparse_gate_up_tmp,
@@ -354,7 +354,7 @@ static jinf_status forward_layer_sparse_ffn(jinf_engine* e, int layer, float* hi
     cudaMemcpy(e->host_hidden_state, norm_out, n * sizeof(float), cudaMemcpyDeviceToHost);
 
     int n_active = 0;
-    jinf_status s = jinf_predictor_predict(e->predictor, e->host_hidden_state, layer,
+    jinf_status s = jinf_predictor_predict_static(e->predictor, e->host_hidden_state, layer,
                                             e->host_active_ids, &n_active);
     if (s != JINF_OK || n_active == 0) {
         // Fallback: no neurons active, just skip FFN (output is just the residual)
@@ -612,7 +612,7 @@ static jinf_status forward_layer_cold(jinf_engine* e, int layer, float* hidden_s
             cudaMemcpy(e->host_hidden_state, norm_out, n * sizeof(float), cudaMemcpyDeviceToHost);
 
             int n_active = 0;
-            jinf_predictor_predict(e->predictor, e->host_hidden_state, layer,
+            jinf_predictor_predict_static(e->predictor, e->host_hidden_state, layer,
                                     e->host_active_ids, &n_active);
 
             if (n_active > 0) {

@@ -12,6 +12,9 @@
 struct jinf_activation_predictor {
     jinf_predictor_config config;
 
+    // Mode: 0 = MLP predictor, 1 = static (frequency-threshold) predictor
+    int mode;
+
     // Shared predictor weights: 2-layer MLP
     // Layer 1: [n_embd + layer_embd_dim] -> hidden_dim
     // Layer 2: hidden_dim -> n_ff
@@ -22,6 +25,11 @@ struct jinf_activation_predictor {
     float* layer_emb; // [n_layers x layer_embd_dim]
 
     int layer_embd_dim;
+
+    // Static predictor fields (mode == 1)
+    float static_threshold;
+    std::vector<std::vector<int>> static_active_neurons;   // precomputed per-layer
+    std::vector<std::vector<float>> static_frequencies;    // raw frequencies
 
     // Online accuracy tracking
     struct layer_stats {
@@ -211,4 +219,111 @@ float jinf_predictor_accuracy(const jinf_activation_predictor* pred, int layer_i
     int total = pred->stats[layer_id].total_predictions;
     if (total == 0) return 0.0f;
     return (float)pred->stats[layer_id].correct_predictions / (float)total;
+}
+
+// ---- Static predictor (Phase 2 MVP) ----
+
+jinf_status jinf_predictor_create_static(jinf_activation_predictor** pred,
+                                          const char* profile_path,
+                                          float threshold) {
+    if (!pred || !profile_path) return JINF_ERR_INVALID;
+
+    FILE* fp = fopen(profile_path, "rb");
+    if (!fp) {
+        JINF_LOG("Failed to open activation profile: %s", profile_path);
+        return JINF_ERR_IO;
+    }
+
+    int n_layers, n_ff, total_tokens;
+    if (fread(&n_layers, sizeof(int), 1, fp) != 1 ||
+        fread(&n_ff, sizeof(int), 1, fp) != 1 ||
+        fread(&total_tokens, sizeof(int), 1, fp) != 1) {
+        fclose(fp);
+        return JINF_ERR_PARSE;
+    }
+
+    if (n_layers <= 0 || n_ff <= 0) {
+        fclose(fp);
+        return JINF_ERR_PARSE;
+    }
+
+    // Create via existing API with dummy config
+    jinf_predictor_config cfg = jinf_predictor_config_default();
+    cfg.n_embd = 1;  // unused for static mode
+    cfg.n_ff = n_ff;
+    cfg.n_layers = n_layers;
+    cfg.threshold = threshold;
+
+    auto* p = new (std::nothrow) jinf_activation_predictor();
+    if (!p) { fclose(fp); return JINF_ERR_OOM; }
+
+    p->config = cfg;
+    p->mode = 1;  // static
+    p->layer_embd_dim = LAYER_EMBD_DIM;
+    p->static_threshold = threshold;
+    p->w1 = nullptr;
+    p->b1 = nullptr;
+    p->w2 = nullptr;
+    p->b2 = nullptr;
+    p->layer_emb = nullptr;
+    p->stats = nullptr;
+
+    p->static_frequencies.resize(n_layers);
+    p->static_active_neurons.resize(n_layers);
+
+    for (int l = 0; l < n_layers; l++) {
+        p->static_frequencies[l].resize(n_ff);
+        if (fread(p->static_frequencies[l].data(), sizeof(float), n_ff, fp) != (size_t)n_ff) {
+            delete p;
+            fclose(fp);
+            return JINF_ERR_PARSE;
+        }
+
+        for (int i = 0; i < n_ff; i++) {
+            if (p->static_frequencies[l][i] > threshold) {
+                p->static_active_neurons[l].push_back(i);
+            }
+        }
+    }
+
+    fclose(fp);
+
+    int total_active = 0;
+    for (int l = 0; l < n_layers; l++) {
+        total_active += (int)p->static_active_neurons[l].size();
+    }
+    float avg_active = (float)total_active / n_layers;
+    float avg_pct = 100.0f * avg_active / n_ff;
+
+    JINF_LOG("Static predictor: %d layers, %d neurons, threshold=%.2f", n_layers, n_ff, threshold);
+    JINF_LOG("Static predictor: avg %.0f/%d neurons active (%.1f%%)", avg_active, n_ff, avg_pct);
+
+    *pred = p;
+    return JINF_OK;
+}
+
+jinf_status jinf_predictor_predict_static(const jinf_activation_predictor* pred,
+                                           const float* /*hidden_state*/,
+                                           int layer_id,
+                                           int* active_ids,
+                                           int* n_active) {
+    if (!pred || !active_ids || !n_active) return JINF_ERR_INVALID;
+    if (pred->mode != 1) return JINF_ERR_INVALID;
+    if (layer_id < 0 || layer_id >= pred->config.n_layers) return JINF_ERR_INVALID;
+
+    const auto& actives = pred->static_active_neurons[layer_id];
+    int count = (int)actives.size();
+
+    memcpy(active_ids, actives.data(), count * sizeof(int));
+    *n_active = count;
+
+    return JINF_OK;
+}
+
+int jinf_predictor_n_layers(const jinf_activation_predictor* pred) {
+    return pred ? pred->config.n_layers : 0;
+}
+
+int jinf_predictor_n_ff(const jinf_activation_predictor* pred) {
+    return pred ? pred->config.n_ff : 0;
 }

@@ -60,3 +60,22 @@ void jinf_predictor_update_stats(jinf_activation_predictor* pred,
 
 // Get prediction accuracy for a layer (0.0 to 1.0).
 float jinf_predictor_accuracy(const jinf_activation_predictor* pred, int layer_id);
+
+// ---- Static predictor API (Phase 2 MVP) ----
+// Creates a predictor from an activation profile file (frequencies).
+// Neurons with frequency > threshold are always included.
+jinf_status jinf_predictor_create_static(jinf_activation_predictor** pred,
+                                          const char* profile_path,
+                                          float threshold);
+
+// Predict with plain C arrays (no std::vector dependency).
+// active_ids: caller-provided buffer [n_ff max], n_active: output count.
+jinf_status jinf_predictor_predict_static(const jinf_activation_predictor* pred,
+                                           const float* hidden_state,
+                                           int layer_id,
+                                           int* active_ids,
+                                           int* n_active);
+
+// Accessors for model dimensions.
+int jinf_predictor_n_layers(const jinf_activation_predictor* pred);
+int jinf_predictor_n_ff(const jinf_activation_predictor* pred);

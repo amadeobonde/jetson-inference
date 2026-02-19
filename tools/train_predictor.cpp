@@ -7,7 +7,7 @@
 //
 // Future: MLP training mode with --train flag using calibration data.
 
-#include "jinf/predictor.h"
+#include "jinf/activation_predictor.h"
 #include "jinf/common.h"
 
 #include <cstdio>
@@ -51,9 +51,9 @@ int main(int argc, char** argv) {
     printf("Creating static predictor from profile: %s\n", args.profile_path);
     printf("Threshold: %.2f\n", args.threshold);
 
-    // Load profile and create predictor
+    // Load profile and create static predictor
     jinf_activation_predictor* pred = nullptr;
-    jinf_status s = jinf_predictor_create(&pred, args.profile_path, args.threshold);
+    jinf_status s = jinf_predictor_create_static(&pred, args.profile_path, args.threshold);
     if (s != JINF_OK) {
         fprintf(stderr, "Failed to create predictor: %s\n", jinf_status_str(s));
         return 1;
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
     for (int l = 0; l < n_layers; l++) {
         int n_active = 0;
         std::vector<int> ids(n_ff);
-        jinf_predictor_predict(pred, nullptr, l, ids.data(), &n_active);
+        jinf_predictor_predict_static(pred, nullptr, l, ids.data(), &n_active);
         total_active += n_active;
         if (l < 4 || l >= n_layers - 2) {
             printf("  Layer %2d: %5d / %d neurons (%.1f%%)\n",
@@ -84,13 +84,33 @@ int main(int argc, char** argv) {
     printf("Effective speedup: %.1fx less FFN compute\n",
            (float)n_ff / avg_active);
 
-    // Save predictor (same format as activation profile for static predictor)
-    s = jinf_predictor_save(pred, args.output_path);
-    if (s != JINF_OK) {
-        fprintf(stderr, "Failed to save predictor: %s\n", jinf_status_str(s));
+    // For static predictor, the output is the same format as the input profile.
+    // The engine loads it via jinf_predictor_create_static at runtime.
+    // Just copy the profile as the predictor file.
+    FILE* in_fp = fopen(args.profile_path, "rb");
+    if (!in_fp) {
+        fprintf(stderr, "Failed to reopen profile\n");
         jinf_predictor_destroy(pred);
         return 1;
     }
+
+    FILE* out_fp = fopen(args.output_path, "wb");
+    if (!out_fp) {
+        fprintf(stderr, "Failed to create output: %s\n", args.output_path);
+        fclose(in_fp);
+        jinf_predictor_destroy(pred);
+        return 1;
+    }
+
+    // Copy profile to output
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in_fp)) > 0) {
+        fwrite(buf, 1, n, out_fp);
+    }
+
+    fclose(in_fp);
+    fclose(out_fp);
 
     printf("\nPredictor saved to: %s\n", args.output_path);
 
