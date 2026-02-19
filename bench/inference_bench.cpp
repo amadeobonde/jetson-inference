@@ -20,7 +20,7 @@ struct bench_args {
 static bool parse_args(int argc, char** argv, bench_args* args) {
     args->model_path = nullptr;
     args->max_tokens = 32;
-    args->max_context = 2048;
+    args->max_context = 512;
     args->gpu_budget_mb = 4500;
     args->buffer_mb = 512;
 
