@@ -34,31 +34,31 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 // ---- Block-level reduction ----
 
 __device__ __forceinline__ float block_reduce_sum(float val) {
-    __shared__ float shared[32];  // one per warp
+    __shared__ float _reduce_buf[32];  // one per warp
     int lane = threadIdx.x % 32;
     int wid  = threadIdx.x / 32;
 
     val = warp_reduce_sum(val);
-    if (lane == 0) shared[wid] = val;
+    if (lane == 0) _reduce_buf[wid] = val;
     __syncthreads();
 
     int num_warps = (blockDim.x + 31) / 32;
-    val = (threadIdx.x < num_warps) ? shared[lane] : 0.0f;
+    val = (threadIdx.x < num_warps) ? _reduce_buf[lane] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
     return val;
 }
 
 __device__ __forceinline__ float block_reduce_max(float val) {
-    __shared__ float shared[32];
+    __shared__ float _reduce_buf[32];
     int lane = threadIdx.x % 32;
     int wid  = threadIdx.x / 32;
 
     val = warp_reduce_max(val);
-    if (lane == 0) shared[wid] = val;
+    if (lane == 0) _reduce_buf[wid] = val;
     __syncthreads();
 
     int num_warps = (blockDim.x + 31) / 32;
-    val = (threadIdx.x < num_warps) ? shared[lane] : -INFINITY;
+    val = (threadIdx.x < num_warps) ? _reduce_buf[lane] : -INFINITY;
     if (wid == 0) val = warp_reduce_max(val);
     return val;
 }

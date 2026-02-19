@@ -38,9 +38,9 @@ __global__ void kernel_attention(
 
     int kv_head = head / (n_heads / n_heads_kv);
 
-    // Shared memory for scores
-    extern __shared__ float shared[];
-    float* scores = shared;  // [n_past]
+    // Shared memory for scores (named smem to avoid collision with block_reduce's shared[])
+    extern __shared__ float smem[];
+    float* scores = smem;  // [n_past]
 
     const float* q_head = q + head * head_dim;
     float scale = rsqrtf((float)head_dim);
