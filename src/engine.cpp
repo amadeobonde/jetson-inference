@@ -307,12 +307,14 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
     jinf_cuda_dequant_matvec(lp->attn_q, norm_out, q_buf, n, n, qtype, stream);
     jinf_cuda_dequant_matvec(lp->attn_k, norm_out, k_buf, kv_dim, n, qtype, stream);
     jinf_cuda_dequant_matvec(lp->attn_v, norm_out, v_buf, kv_dim, n, qtype, stream);
-    if (dbg) debug_gpu("L0 after_RoPE_Q", q_buf, n, stream);
+    if (dbg) {
+        debug_gpu("L0 V_proj", v_buf, kv_dim, stream);
+        debug_gpu("L0 K_proj", k_buf, kv_dim, stream);
+    }
 
     // 3. RoPE
     jinf_cuda_rope(q_buf, k_buf, head_dim, e->n_heads, e->n_heads_kv,
                     e->n_past, e->rope_freq_base, stream);
-    if (dbg) debug_gpu("L0 post_RoPE_Q", q_buf, n, stream);
 
     // 4. Store K, V into cache
     size_t kv_layer_stride = (size_t)e->max_context * kv_dim;
@@ -323,6 +325,12 @@ static jinf_status forward_layer_hot(jinf_engine* e, int layer, float* hidden_st
                      kv_dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyAsync(v_cache_layer + (size_t)e->n_past * kv_dim, v_buf,
                      kv_dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+
+    if (dbg) {
+        debug_gpu("L0 V_cache", v_cache_layer, kv_dim, stream);
+        JINF_LOG("attn args: n_past=%d, head_dim=%d, n_heads=%d, n_kv=%d, max_ctx=%d, kv_stride=%zu",
+                  e->n_past + 1, head_dim, e->n_heads, e->n_heads_kv, e->max_context, kv_layer_stride);
+    }
 
     // 5. Attention: Q @ K^T, softmax, @ V
     float* attn_out = norm_out;  // reuse
