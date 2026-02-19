@@ -56,6 +56,19 @@ struct jinf_block_q8_0 {
 static_assert(sizeof(jinf_block_q8_0) == 34, "Q8_0 block size mismatch");
 #pragma pack(pop)
 
+// Q6_K: 210 bytes for 256 values (6-bit K-quant)
+// Layout: lower 4 bits + upper 2 bits + 8-bit sub-block scales + fp16 super-scale
+// Dequant: d * scales[i/16] * (q6 - 32) where q6 = low4 | (high2 << 4)
+#pragma pack(push, 1)
+struct jinf_block_q6_K {
+    uint8_t  ql[128];   // lower 4 bits of quantized values (256 values, 2 per byte)
+    uint8_t  qh[64];    // upper 2 bits of quantized values (256 values, 4 per byte)
+    int8_t   scales[16]; // sub-block scales (8-bit, 16 sub-blocks of 16 elements)
+    uint16_t d;          // super-block scale (fp16)
+};
+static_assert(sizeof(jinf_block_q6_K) == 210, "Q6_K block size mismatch");
+#pragma pack(pop)
+
 // ---- Block size / type size queries ----
 
 // Number of values per quantization block
@@ -133,6 +146,7 @@ inline size_t jinf_tensor_nbytes(jinf_qtype type, int64_t n_elements) {
 void jinf_dequantize_q4_0(const jinf_block_q4_0* block, float* out, int n_blocks);
 void jinf_dequantize_q4_K(const jinf_block_q4_K* block, float* out, int n_blocks);
 void jinf_dequantize_q8_0(const jinf_block_q8_0* block, float* out, int n_blocks);
+void jinf_dequantize_q6_K(const jinf_block_q6_K* block, float* out, int n_blocks);
 
 // Generic dequantize dispatcher
 void jinf_dequantize(const void* data, jinf_qtype type, float* out, int64_t n_elements);

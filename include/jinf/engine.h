@@ -58,6 +58,17 @@ struct jinf_layer_ptrs {
     void* ffn_up;        // [n_embd, n_ff]
     void* ffn_down;      // [n_ff, n_embd]
 
+    // Per-tensor quantization types (Q4_K_M models mix Q4_K and Q6_K)
+    int32_t attn_norm_type;
+    int32_t ffn_norm_type;
+    int32_t attn_q_type;
+    int32_t attn_k_type;
+    int32_t attn_v_type;
+    int32_t attn_output_type;
+    int32_t ffn_gate_type;
+    int32_t ffn_up_type;
+    int32_t ffn_down_type;
+
     bool is_hot;         // all weights for this layer are GPU-resident
 };
 

@@ -131,6 +131,59 @@ __global__ void kernel_dequant_matvec_q8_0(
     }
 }
 
+// ---- Fused dequant + mat-vec for Q6_K ----
+
+__global__ void kernel_dequant_matvec_q6_K(
+    const jinf_block_q6_K* __restrict__ weight,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int n_blocks_per_row = cols / 256;
+
+    float sum = 0.0f;
+    for (int b = threadIdx.x / 32; b < n_blocks_per_row; b += blockDim.x / 32) {
+        const jinf_block_q6_K* blk = &weight[row * n_blocks_per_row + b];
+        float d = half_to_float(blk->d);
+
+        int lane = threadIdx.x % 32;
+        int base_elem = b * 256;
+
+        // Each thread in the warp handles 8 elements
+        int elem_start = lane * 8;
+        if (elem_start < 256) {
+            int sb = elem_start / 16;  // sub-block index
+            float scale = d * (float)blk->scales[sb];
+
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int idx = elem_start + i;
+
+                // Lower 4 bits from ql
+                uint8_t ql_byte = blk->ql[idx / 2];
+                int low4 = (idx & 1) ? (ql_byte >> 4) : (ql_byte & 0x0F);
+
+                // Upper 2 bits from qh
+                uint8_t qh_byte = blk->qh[idx / 4];
+                int high2 = (qh_byte >> (2 * (idx % 4))) & 0x03;
+
+                int q6 = low4 | (high2 << 4);
+                float w = scale * (float)(q6 - 32);
+                sum += w * input[base_elem + idx];
+            }
+        }
+    }
+
+    sum = block_reduce_sum(sum);
+
+    if (threadIdx.x == 0) {
+        output[row] = sum;
+    }
+}
+
 // ---- Residual add kernel ----
 
 __global__ void kernel_residual_add(float* __restrict__ a, const float* __restrict__ b, int n) {
@@ -160,6 +213,10 @@ extern "C" void jinf_cuda_dequant_matvec(const void* weight, const float* input,
         case JINF_TYPE_Q8_0:
             kernel_dequant_matvec_q8_0<<<rows, threads, 0, stream>>>(
                 (const jinf_block_q8_0*)weight, input, output, rows, cols);
+            break;
+        case JINF_TYPE_Q6_K:
+            kernel_dequant_matvec_q6_K<<<rows, threads, 0, stream>>>(
+                (const jinf_block_q6_K*)weight, input, output, rows, cols);
             break;
         default:
             fprintf(stderr, "[jinf] Unsupported qtype %d for dequant_matvec\n", qtype);

@@ -77,6 +77,40 @@ __global__ void kernel_dequantize_q8_0(const jinf_block_q8_0* __restrict__ block
     }
 }
 
+// ---- Q6_K dequantization: 1 warp (32 threads) per super-block of 256 values ----
+
+__global__ void kernel_dequantize_q6_K(const jinf_block_q6_K* __restrict__ blocks,
+                                        float* __restrict__ output,
+                                        int n_blocks) {
+    int bid = blockIdx.x;
+    if (bid >= n_blocks) return;
+
+    int tid = threadIdx.x;  // 0..31
+
+    float d = half_to_float(blocks[bid].d);
+    float* out = output + bid * 256;
+
+    // Each thread handles 8 contiguous values
+    int elem_start = tid * 8;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int idx = elem_start + i;
+        int sb = idx / 16;  // sub-block index (0..15)
+
+        // Lower 4 bits from ql (2 values per byte)
+        uint8_t ql_byte = blocks[bid].ql[idx / 2];
+        int low4 = (idx & 1) ? (ql_byte >> 4) : (ql_byte & 0x0F);
+
+        // Upper 2 bits from qh (4 values per byte)
+        uint8_t qh_byte = blocks[bid].qh[idx / 4];
+        int high2 = (qh_byte >> (2 * (idx % 4))) & 0x03;
+
+        int q6 = low4 | (high2 << 4);  // 6-bit value (0..63)
+        out[idx] = d * (float)blocks[bid].scales[sb] * (float)(q6 - 32);
+    }
+}
+
 // ---- Launch wrappers ----
 
 extern "C" void jinf_cuda_dequantize_q4_0(const void* data, float* output,
@@ -100,4 +134,11 @@ extern "C" void jinf_cuda_dequantize_q8_0(const void* data, float* output,
     int blocks = (n_blocks + threads - 1) / threads;
     kernel_dequantize_q8_0<<<blocks, threads, 0, stream>>>(
         (const jinf_block_q8_0*)data, output, n_blocks);
+}
+
+extern "C" void jinf_cuda_dequantize_q6_K(const void* data, float* output,
+                                            int n_blocks, cudaStream_t stream) {
+    // 1 block per Q6_K super-block, 32 threads per block (1 warp)
+    kernel_dequantize_q6_K<<<n_blocks, 32, 0, stream>>>(
+        (const jinf_block_q6_K*)data, output, n_blocks);
 }
